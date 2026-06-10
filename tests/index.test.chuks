@@ -1,0 +1,120 @@
+// Tests for chuks_websocket — pure-Chuks RFC 6455 implementation.
+// Run: chuks test tests/index.test.chuks
+
+import { test } from "std/test"
+import { time } from "std/time"
+import {
+    computeAcceptKey,
+    WSServerOptionsBuilder,
+    WSClientOptionsBuilder,
+    WebSocketServer,
+    WebSocketConnection,
+    connect,
+    createWSServer,
+    STATE_OPEN,
+    CLOSE_NORMAL
+} from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+const start = test.now()
+
+// Thread-safe collector: the client's onMessage fires on its read-loop task
+// (a separate OS thread under AOT), so the main test thread must read what it
+// collected through a lock to get a memory barrier — otherwise it races on a
+// plain slice header and reads stale length.
+@threadSafe
+class Collector {
+    var items: []string
+    constructor() { this.items = [] }
+    public add(s: string): void { lock (this) { this.items.push(s) } }
+    public count(): int { var n: int = 0; lock (this) { n = this.items.length } return n }
+    public first(): string { var s: string = ""; lock (this) { if (this.items.length > 0) { s = this.items[0] } } return s }
+}
+
+// ─── 1. Handshake accept-key (RFC 6455 §1.3 canonical vector) ───────────────
+// key "dGhlIHNhbXBsZSBub25jZQ==" must produce "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
+try {
+    var accept: string = computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==")
+    test.assertEqual(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "RFC 6455 accept-key vector")
+    passed++
+} catch (e) {
+    failed++
+    failures.push("accept-key vector: " + string(e))
+}
+
+// ─── 2. Server options builder: defaults + fluent overrides ─────────────────
+try {
+    var defs = new WSServerOptionsBuilder().build()
+    test.assertEqual(defs.host, "0.0.0.0", "default server host")
+    test.assertEqual(defs.port, 8080, "default server port")
+    test.assertEqual(defs.maxMessageSize, 1048576, "default max message size")
+
+    var opts = new WSServerOptionsBuilder().host("127.0.0.1").port(9001).path("/ws").maxMessageSize(2048).build()
+    test.assertEqual(opts.host, "127.0.0.1", "fluent host")
+    test.assertEqual(opts.port, 9001, "fluent port")
+    test.assertEqual(opts.path, "/ws", "fluent path")
+    test.assertEqual(opts.maxMessageSize, 2048, "fluent max size")
+    passed++
+} catch (e) {
+    failed++
+    failures.push("server options builder: " + string(e))
+}
+
+// ─── 3. Client options builder: defaults + fluent overrides ─────────────────
+try {
+    var cdef = new WSClientOptionsBuilder().build()
+    test.assertEqual(cdef.handshakeTimeoutMs, 10000, "default handshake timeout")
+    test.assertEqual(cdef.autoReconnect, false, "default autoReconnect")
+
+    var copts = new WSClientOptionsBuilder().autoReconnect(true).reconnectDelayMs(250).maxReconnectTries(3).build()
+    test.assertEqual(copts.autoReconnect, true, "fluent autoReconnect")
+    test.assertEqual(copts.reconnectDelayMs, 250, "fluent reconnect delay")
+    test.assertEqual(copts.maxReconnectTries, 3, "fluent max reconnect tries")
+    passed++
+} catch (e) {
+    failed++
+    failures.push("client options builder: " + string(e))
+}
+
+// ─── 4. End-to-end echo over a loopback socket ──────────────────────────────
+// Boots a real server, connects a real client, and round-trips a message
+// through the full handshake + frame codec + read pump.
+try {
+    var port: int = 39555
+    var server: WebSocketServer = createWSServer(new WSServerOptionsBuilder().host("127.0.0.1").port(port).build())
+    server.onConnection(function(conn: WebSocketConnection): void {
+        conn.onMessage(function(msg: string): void {
+            conn.send("echo:" + msg)
+        })
+    })
+    spawn server.listen()
+    time.sleep(300)   // let the listener bind
+
+    var received: Collector = new Collector()
+    var client = connect("ws://127.0.0.1:" + string(port), null)
+    client.onMessage(function(msg: string): void {
+        received.add(msg)
+    })
+
+    test.assert(client.readyState() == STATE_OPEN, "client should be OPEN after connect")
+
+    client.send("hello")
+    time.sleep(500)   // allow the round trip
+
+    test.assertEqual(received.count(), 1, "client should receive exactly one echo")
+    if (received.count() > 0) {
+        test.assertEqual(received.first(), "echo:hello", "echoed payload should match")
+    }
+    test.assert(server.connectionCount() == 1, "server should report one live connection")
+
+    client.close(CLOSE_NORMAL, "done")
+    server.stop()
+    passed++
+} catch (e) {
+    failed++
+    failures.push("echo round-trip: " + string(e))
+}
+
+test.report(passed, failed, failures, test.now() - start)

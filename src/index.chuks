@@ -1,0 +1,992 @@
+// ─── chuks_websocket ─────────────────────────────────────────────────────────
+// Production-ready WebSocket client and server for Chuks — 100% pure Chuks.
+//
+// Implements RFC 6455 over std/net TCP primitives: the upgrade handshake
+// (SHA-1 + base64 accept key), full frame codec (FIN/opcode/mask, 7/16/64-bit
+// payload lengths), message fragmentation reassembly, interleaved control
+// frames (ping/pong/close), and the close handshake with status codes.
+//
+// Design (mirrors chuks_redis): strongly-typed options + fluent builders
+// instead of untyped maps, and a @threadSafe server that serializes mutations
+// of its shared connection/room registry with `lock(this) { … }` while doing
+// blocking socket I/O outside the lock.
+//
+// Server:
+//   import { WebSocketServer, WSServerOptionsBuilder } from "pkg/@chuks/websocket"
+//   var wss = new WebSocketServer(new WSServerOptionsBuilder().port(8080).build())
+//   wss.onConnection(function(conn: WebSocketConnection): void {
+//       conn.onMessage(function(msg: string): void { conn.send("echo: " + msg) })
+//   })
+//   wss.listen()
+//
+// Client:
+//   import { connect } from "pkg/@chuks/websocket"
+//   var client = connect("ws://localhost:8080", null)
+//   client.onMessage(function(msg: string): void { println(msg) })
+//   client.send("hello")
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { json } from "std/json"
+import { crypto } from "std/crypto"
+import { base64 } from "std/base64"
+import { time } from "std/time"
+import { uuid } from "std/uuid"
+import { strings } from "std/strings"
+import { Buffer } from "std/buffer"
+import { TcpConnection, TcpServer } from "std/net"
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+// Frame opcodes (RFC 6455 §5.2).
+const OPCODE_CONTINUATION = 0
+const OPCODE_TEXT = 1
+const OPCODE_BINARY = 2
+const OPCODE_CLOSE = 8
+const OPCODE_PING = 9
+const OPCODE_PONG = 10
+
+// Close status codes (RFC 6455 §7.4.1).
+export const CLOSE_NORMAL = 1000
+export const CLOSE_GOING_AWAY = 1001
+export const CLOSE_PROTOCOL_ERROR = 1002
+export const CLOSE_UNSUPPORTED = 1003
+export const CLOSE_NO_STATUS = 1005
+export const CLOSE_ABNORMAL = 1006
+export const CLOSE_INVALID_PAYLOAD = 1007
+export const CLOSE_POLICY_VIOLATION = 1008
+export const CLOSE_TOO_LARGE = 1009
+export const CLOSE_MISSING_EXTENSION = 1010
+export const CLOSE_INTERNAL_ERROR = 1011
+export const CLOSE_SERVICE_RESTART = 1012
+export const CLOSE_TRY_AGAIN_LATER = 1013
+
+// Ready states (mirrors the browser WebSocket API).
+export const STATE_CONNECTING = 0
+export const STATE_OPEN = 1
+export const STATE_CLOSING = 2
+export const STATE_CLOSED = 3
+
+// Magic GUID concatenated with the client key during the handshake (RFC 6455 §4.2.2).
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// ─── Typed options + builders ──────────────────────────────────────────────
+
+// Server options. Build with WSServerOptionsBuilder; every field has a
+// sensible default so a bare `.port(n).build()` is enough.
+export dataType WSServerOptions {
+    host:           string;   // bind address; default "0.0.0.0"
+    port:           int;      // listen port; required
+    path:           string;   // required handshake path; "" = accept any path
+    maxMessageSize: int;      // max inbound message bytes; default 1 MiB
+    readTimeoutMs:  int;      // per-read deadline; 0 = block indefinitely
+}
+
+export class WSServerOptionsBuilder {
+    var _o: WSServerOptions
+
+    constructor() {
+        this._o = { host: "0.0.0.0", port: 8080, path: "", maxMessageSize: 1048576, readTimeoutMs: 0 }
+    }
+
+    public host(h: string): WSServerOptionsBuilder { this._o.host = h; return this }
+    public port(p: int): WSServerOptionsBuilder { this._o.port = p; return this }
+    public path(p: string): WSServerOptionsBuilder { this._o.path = p; return this }
+    public maxMessageSize(n: int): WSServerOptionsBuilder { this._o.maxMessageSize = n; return this }
+    public readTimeoutMs(ms: int): WSServerOptionsBuilder { this._o.readTimeoutMs = ms; return this }
+
+    public build(): WSServerOptions { return this._o }
+}
+
+// Client options. Build with WSClientOptionsBuilder.
+export dataType WSClientOptions {
+    maxMessageSize:    int;   // max inbound message bytes; default 1 MiB
+    handshakeTimeoutMs: int;  // connect + handshake deadline; default 10000
+    autoReconnect:     bool;  // reconnect on unexpected drop; default false
+    reconnectDelayMs:  int;   // delay between reconnect attempts; default 1000
+    maxReconnectTries: int;   // 0 = unlimited
+}
+
+export class WSClientOptionsBuilder {
+    var _o: WSClientOptions
+
+    constructor() {
+        this._o = { maxMessageSize: 1048576, handshakeTimeoutMs: 10000, autoReconnect: false, reconnectDelayMs: 1000, maxReconnectTries: 0 }
+    }
+
+    public maxMessageSize(n: int): WSClientOptionsBuilder { this._o.maxMessageSize = n; return this }
+    public handshakeTimeoutMs(ms: int): WSClientOptionsBuilder { this._o.handshakeTimeoutMs = ms; return this }
+    public autoReconnect(on: bool): WSClientOptionsBuilder { this._o.autoReconnect = on; return this }
+    public reconnectDelayMs(ms: int): WSClientOptionsBuilder { this._o.reconnectDelayMs = ms; return this }
+    public maxReconnectTries(n: int): WSClientOptionsBuilder { this._o.maxReconnectTries = n; return this }
+
+    public build(): WSClientOptions { return this._o }
+}
+
+// ─── Frame codec (RFC 6455 §5) ───────────────────────────────────────────────
+
+// A single decoded frame.
+class WSFrame {
+    var opcode: int
+    var payload: Buffer
+    var fin: bool
+
+    constructor(opcode: int, payload: Buffer, fin: bool) {
+        this.opcode = opcode
+        this.payload = payload
+        this.fin = fin
+    }
+}
+
+// Encode a frame. Client→server frames MUST be masked; server→client MUST NOT
+// (RFC 6455 §5.1). Returns a Buffer positioned at offset 0, ready to write.
+function buildFrame(opcode: int, payload: Buffer, masked: bool): Buffer {
+    var payloadLen: int = payload.length()
+    var headerSize: int = 2
+    if (payloadLen >= 126 && payloadLen <= 65535) {
+        headerSize = headerSize + 2
+    } else if (payloadLen > 65535) {
+        headerSize = headerSize + 8
+    }
+    var maskSize: int = 0
+    if (masked) { maskSize = 4 }
+
+    var frame: Buffer = Buffer.alloc(headerSize + maskSize + payloadLen)
+
+    // Byte 0: FIN (0x80) | opcode.
+    frame.writeUInt8(128 + opcode)
+
+    // Byte 1: MASK bit | length (or 126/127 sentinel for extended length).
+    var maskBit: int = 0
+    if (masked) { maskBit = 128 }
+    if (payloadLen < 126) {
+        frame.writeUInt8(maskBit + payloadLen)
+    } else if (payloadLen <= 65535) {
+        frame.writeUInt8(maskBit + 126)
+        frame.writeUInt16BE(payloadLen)
+    } else {
+        frame.writeUInt8(maskBit + 127)
+        frame.writeInt64BE(payloadLen)
+    }
+
+    if (masked) {
+        var maskKey: Buffer = Buffer.fromHex(crypto.randomBytes(4))
+        frame.writeBytesAll(maskKey)
+        for (var i: int = 0; i < payloadLen; i = i + 1) {
+            frame.writeUInt8(payload.getByte(i) ^ maskKey.getByte(i % 4))
+        }
+    } else {
+        frame.writeBytesAll(payload)
+    }
+
+    frame.seek(0)
+    return frame
+}
+
+// Read exactly one frame off the wire, using readExact for every fixed-size
+// field so partial reads can't corrupt the stream. Returns null on EOF, a
+// short read, or an over-size payload (caller should treat null as "closed").
+function readFrameRaw(tcp: TcpConnection, maxMessageSize: int): WSFrame? {
+    try {
+        var header: Buffer = tcp.readExact(2)
+        if (header.length() < 2) { return null }
+        var byte0: int = header.getByte(0)
+        var byte1: int = header.getByte(1)
+
+        var fin: bool = (byte0 & 128) != 0
+        var opcode: int = byte0 & 15
+        var maskFlag: bool = (byte1 & 128) != 0
+        var payloadLen: int = byte1 & 127
+
+        if (payloadLen == 126) {
+            var ext2: Buffer = tcp.readExact(2)
+            if (ext2.length() < 2) { return null }
+            ext2.seek(0)
+            payloadLen = ext2.readUInt16BE()
+        } else if (payloadLen == 127) {
+            var ext8: Buffer = tcp.readExact(8)
+            if (ext8.length() < 8) { return null }
+            ext8.seek(0)
+            payloadLen = int(ext8.readInt64BE())
+        }
+
+        if (payloadLen < 0 || payloadLen > maxMessageSize) { return null }
+
+        var maskKey: Buffer? = null
+        if (maskFlag) {
+            var mk: Buffer = tcp.readExact(4)
+            if (mk.length() < 4) { return null }
+            maskKey = mk
+        }
+
+        var payload: Buffer = Buffer.alloc(0)
+        if (payloadLen > 0) {
+            payload = tcp.readExact(payloadLen)
+            if (payload.length() < payloadLen) { return null }
+            if (maskFlag && maskKey != null) {
+                var key: Buffer = maskKey
+                for (var i: int = 0; i < payloadLen; i = i + 1) {
+                    payload.setByte(i, payload.getByte(i) ^ key.getByte(i % 4))
+                }
+            }
+        }
+
+        return new WSFrame(opcode, payload, fin)
+    } catch (e) {
+        return null
+    }
+}
+
+function sendFrame(tcp: TcpConnection, opcode: int, payload: Buffer, masked: bool): void {
+    tcp.writeAll(buildFrame(opcode, payload, masked))
+}
+
+function sendText(tcp: TcpConnection, message: string, masked: bool): void {
+    sendFrame(tcp, OPCODE_TEXT, Buffer.fromString(message), masked)
+}
+
+function sendPing(tcp: TcpConnection, payload: Buffer, masked: bool): void {
+    sendFrame(tcp, OPCODE_PING, payload, masked)
+}
+
+function sendPong(tcp: TcpConnection, payload: Buffer, masked: bool): void {
+    sendFrame(tcp, OPCODE_PONG, payload, masked)
+}
+
+function sendClose(tcp: TcpConnection, code: int, reason: string, masked: bool): void {
+    var reasonBuf: Buffer = Buffer.fromString(reason)
+    var payload: Buffer = Buffer.alloc(2 + reasonBuf.length())
+    payload.writeUInt16BE(code)
+    payload.writeBytesAll(reasonBuf)
+    sendFrame(tcp, OPCODE_CLOSE, payload, masked)
+}
+
+// ─── Read pump (fragmentation + control frames) ──────────────────────────────
+// Drives a connection's read side: reassembles fragmented data messages,
+// auto-responds to ping with pong, and handles the close handshake. Delivered
+// text is handed to onMessage; the loop returns when the peer closes, the
+// socket drops, or isOpen() goes false. `masked` is the masking to apply to
+// our OUTBOUND control frames (client=true, server=false).
+function runReadPump(
+    tcp: TcpConnection,
+    maxMessageSize: int,
+    masked: bool,
+    isOpen: function(): bool,
+    onMessage: function(msg: string): void,
+    onPing: function(): void,
+    onPong: function(): void,
+    onClose: function(code: int, reason: string, clean: bool): void
+): void {
+    var fragOpcode: int = -1
+    var fragParts: []Buffer = []
+
+    while (isOpen()) {
+        var frame: WSFrame? = readFrameRaw(tcp, maxMessageSize)
+        if (frame == null) {
+            onClose(CLOSE_ABNORMAL, "connection lost", false)
+            return
+        }
+        var f: WSFrame = frame
+        var op: int = f.opcode
+
+        if (op == OPCODE_PING) {
+            try { sendPong(tcp, f.payload, masked) } catch (e) { /* peer gone */ }
+            onPing()
+        } else if (op == OPCODE_PONG) {
+            onPong()
+        } else if (op == OPCODE_CLOSE) {
+            var code: int = CLOSE_NO_STATUS
+            var reason: string = ""
+            if (f.payload.length() >= 2) {
+                f.payload.seek(0)
+                code = f.payload.readUInt16BE()
+                if (f.payload.remaining() > 0) {
+                    reason = f.payload.readString(f.payload.remaining())
+                }
+            }
+            try { sendClose(tcp, code, reason, masked) } catch (e) { /* peer gone */ }
+            onClose(code, reason, true)
+            return
+        } else if (op == OPCODE_TEXT || op == OPCODE_BINARY) {
+            if (f.fin) {
+                // Single, unfragmented message — the common case.
+                onMessage(f.payload.toStringUtf8())
+            } else {
+                // Start of a fragmented message; remember the data opcode.
+                fragOpcode = op
+                fragParts = [f.payload]
+            }
+        } else if (op == OPCODE_CONTINUATION) {
+            if (fragOpcode == -1) {
+                // Continuation without an initial frame — protocol error.
+                try { sendClose(tcp, CLOSE_PROTOCOL_ERROR, "unexpected continuation", masked) } catch (e) { }
+                onClose(CLOSE_PROTOCOL_ERROR, "unexpected continuation", false)
+                return
+            }
+            fragParts.push(f.payload)
+            if (f.fin) {
+                var whole: Buffer = Buffer.concat(fragParts)
+                onMessage(whole.toStringUtf8())
+                fragOpcode = -1
+                fragParts = []
+            }
+        }
+    }
+}
+
+// ─── Handshake helpers ───────────────────────────────────────────────────────
+
+// Sec-WebSocket-Accept = base64( SHA-1( clientKey + WS_GUID ) ). Exported as a
+// utility for callers writing a custom handshake (and so the crypto is unit-testable).
+//
+// Note: we go through the hex form (crypto.sha1 → Buffer.fromHex) rather than
+// crypto.sha1Raw. sha1Raw currently returns an EMPTY buffer under the AOT
+// backend (a std runtime VM↔AOT divergence), whereas crypto.sha1 is correct on
+// both. The two produce identical bytes; this keeps the handshake correct in
+// native builds.
+export function computeAcceptKey(clientKey: string): string {
+    return base64.encodeBuffer(Buffer.fromHex(crypto.sha1(clientKey + WS_GUID)))
+}
+
+// Read the HTTP request/response head (up to the blank line) off the socket,
+// one byte at a time so we never consume the first WebSocket frame's bytes.
+function readHttpHead(tcp: TcpConnection): string {
+    var acc: string = ""
+    var maxHead: int = 16384
+    while (acc.length < maxHead) {
+        var chunk: Buffer = tcp.readExact(1)
+        if (chunk.length() < 1) { return acc }
+        acc = acc + chunk.toStringUtf8()
+        if (strings.endsWith(acc, "\r\n\r\n")) { return acc }
+    }
+    return acc
+}
+
+class HttpRequest {
+    var method: string
+    var path: string
+    var headers: map[string]string
+    constructor(method: string, path: string, headers: map[string]string) {
+        this.method = method
+        this.path = path
+        this.headers = headers
+    }
+}
+
+function parseHttpRequest(raw: string): HttpRequest? {
+    var lines: []string = strings.split(raw, "\r\n")
+    if (lines.length < 1) { return null }
+    var requestLine: []string = strings.split(lines[0], " ")
+    if (requestLine.length < 3) { return null }
+    var headers: map[string]string = {}
+    for (var i: int = 1; i < lines.length; i = i + 1) {
+        var line: string = lines[i]
+        if (line == "") { break }
+        var colonIdx: int = strings.indexOf(line, ": ")
+        if (colonIdx > 0) {
+            var key: string = strings.toLower(strings.substring(line, 0, colonIdx))
+            var value: string = strings.substring(line, colonIdx + 2, line.length)
+            headers[key] = value
+        }
+    }
+    return new HttpRequest(requestLine[0], requestLine[1], headers)
+}
+
+class WsUrl {
+    var host: string
+    var port: int
+    var path: string
+    var secure: bool
+    constructor(host: string, port: int, path: string, secure: bool) {
+        this.host = host
+        this.port = port
+        this.path = path
+        this.secure = secure
+    }
+}
+
+function parseWsUrl(url: string): WsUrl {
+    var isSecure: bool = false
+    var rest: string = url
+    if (strings.startsWith(url, "wss://")) {
+        isSecure = true
+        rest = strings.substring(url, 6, url.length)
+    } else if (strings.startsWith(url, "ws://")) {
+        rest = strings.substring(url, 5, url.length)
+    }
+    var pathIdx: int = strings.indexOf(rest, "/")
+    var hostPort: string = rest
+    var rawPath: string = "/"
+    if (pathIdx > 0) {
+        hostPort = strings.substring(rest, 0, pathIdx)
+        rawPath = strings.substring(rest, pathIdx, rest.length)
+    }
+    var colonIdx: int = strings.indexOf(hostPort, ":")
+    var rawHost: string = hostPort
+    var rawPort: int = 80
+    if (isSecure) { rawPort = 443 }
+    if (colonIdx > 0) {
+        rawHost = strings.substring(hostPort, 0, colonIdx)
+        rawPort = int(strings.substring(hostPort, colonIdx + 1, hostPort.length))
+    }
+    return new WsUrl(rawHost, rawPort, rawPath, isSecure)
+}
+
+// ─── WebSocketEvent ──────────────────────────────────────────────────────────
+// Named event with a JSON payload, for event-style messaging.
+
+export class WebSocketEvent {
+    var name: string
+    var payload: any
+    var timestamp: int
+
+    constructor(name: string, payload: any) {
+        this.name = name
+        this.payload = payload
+        this.timestamp = time.now()
+    }
+
+    // Wire format: { "event": "<name>", "data": <payload> }.
+    public serialize(): string {
+        return json.stringify({ "event": this.name, "data": this.payload })
+    }
+}
+
+// ─── WebSocketConnection ─────────────────────────────────────────────────────
+// One server-side client connection. @threadSafe: send() may be called from
+// the connection's own read pump and from broadcast loops on other tasks, so
+// writes are serialized with lock(this).
+
+@threadSafe
+export class WebSocketConnection {
+    var _id: string
+    var _tcp: TcpConnection
+    var _readyState: int
+    var _rooms: []string
+    var _data: map[string]any
+    var _onMessageHandler: function?(msg: string): void
+    var _onCloseHandler: function?(code: int, reason: string): void
+    var _onErrorHandler: function?(err: string): void
+    var _onPongHandler: function?(): void
+    var _createdAt: int
+    var _lastActivity: int
+    var _messagesSent: int
+    var _messagesReceived: int
+
+    constructor(connectionId: string, tcp: TcpConnection) {
+        this._id = connectionId
+        this._tcp = tcp
+        this._readyState = STATE_OPEN
+        this._rooms = []
+        this._data = {}
+        this._onMessageHandler = null
+        this._onCloseHandler = null
+        this._onErrorHandler = null
+        this._onPongHandler = null
+        this._createdAt = time.now()
+        this._lastActivity = time.now()
+        this._messagesSent = 0
+        this._messagesReceived = 0
+    }
+
+    public id(): string { return this._id }
+    public readyState(): int { return this._readyState }
+    public isOpen(): bool { return this._readyState == STATE_OPEN }
+    public connectedAt(): int { return this._createdAt }
+    public lastActivity(): int { return this._lastActivity }
+    public sentCount(): int { return this._messagesSent }
+    public receivedCount(): int { return this._messagesReceived }
+    public remoteAddr(): string { return this._tcp.remoteAddr() }
+
+    // Per-connection scratch data (userId, session, …).
+    public set(key: string, value: any): void { this._data[key] = value }
+    public get(key: string): any { return this._data[key] }
+    public rooms(): []string { return this._rooms }
+
+    // Send a text message (server frames are never masked).
+    public send(message: string): void {
+        if (this._readyState != STATE_OPEN) { return }
+        lock (this) {
+            try {
+                sendText(this._tcp, message, false)
+                this._messagesSent = this._messagesSent + 1
+                this._lastActivity = time.now()
+            } catch (e) {
+                this._fireError("send failed: " + string(e))
+            }
+        }
+    }
+
+    public sendJSON(data: any): void { this.send(json.stringify(data)) }
+
+    public emit(eventName: string, payload: any): void {
+        this.send(new WebSocketEvent(eventName, payload).serialize())
+    }
+
+    public ping(): void {
+        if (this._readyState != STATE_OPEN) { return }
+        lock (this) {
+            try { sendPing(this._tcp, Buffer.alloc(0), false) } catch (e) { this._fireError("ping failed: " + string(e)) }
+        }
+    }
+
+    public close(code: int, reason: string): void {
+        if (this._readyState == STATE_CLOSED || this._readyState == STATE_CLOSING) { return }
+        this._readyState = STATE_CLOSING
+        lock (this) {
+            try { sendClose(this._tcp, code, reason, false) } catch (e) { }
+            try { this._tcp.close() } catch (e) { }
+        }
+        this._readyState = STATE_CLOSED
+    }
+
+    // ── Rooms ──────────────────────────────────────────────────────────
+    public join(room: string): void {
+        for (var i: int = 0; i < this._rooms.length; i = i + 1) {
+            if (this._rooms[i] == room) { return }
+        }
+        this._rooms.push(room)
+    }
+
+    public leave(room: string): void {
+        var next: []string = []
+        for (var i: int = 0; i < this._rooms.length; i = i + 1) {
+            if (this._rooms[i] != room) { next.push(this._rooms[i]) }
+        }
+        this._rooms = next
+    }
+
+    public inRoom(room: string): bool {
+        for (var i: int = 0; i < this._rooms.length; i = i + 1) {
+            if (this._rooms[i] == room) { return true }
+        }
+        return false
+    }
+
+    // ── Handlers ───────────────────────────────────────────────────────
+    public onMessage(handler: function(msg: string): void): void { this._onMessageHandler = handler }
+    public onClose(handler: function(code: int, reason: string): void): void { this._onCloseHandler = handler }
+    public onError(handler: function(err: string): void): void { this._onErrorHandler = handler }
+    public onPong(handler: function(): void): void { this._onPongHandler = handler }
+
+    // ── Internal dispatch (called by the server read pump) ─────────────
+    public _deliver(message: string): void {
+        this._messagesReceived = this._messagesReceived + 1
+        this._lastActivity = time.now()
+        var h = this._onMessageHandler
+        if (h != null) { h(message) }
+    }
+
+    public _fireClose(code: int, reason: string): void {
+        this._readyState = STATE_CLOSED
+        var h = this._onCloseHandler
+        if (h != null) { h(code, reason) }
+    }
+
+    public _firePong(): void {
+        var h = this._onPongHandler
+        if (h != null) { h() }
+    }
+
+    private _fireError(err: string): void {
+        var h = this._onErrorHandler
+        if (h != null) { h(err) }
+    }
+
+    public _tcpConn(): TcpConnection { return this._tcp }
+}
+
+// ─── WebSocketServer ─────────────────────────────────────────────────────────
+
+@threadSafe
+export class WebSocketServer {
+    var _options: WSServerOptions
+    var _server: TcpServer?
+    var _running: bool
+    // Registry: a map keyed by id plus a parallel id list for ordered, safe
+    // iteration (map-key iteration is avoided for portability). Both are only
+    // mutated under lock(this).
+    var _connections: map[string]WebSocketConnection
+    var _ids: []string
+    var _onConnectionHandler: function?(conn: WebSocketConnection): void
+    var _onDisconnectHandler: function?(conn: WebSocketConnection): void
+
+    constructor(options: WSServerOptions) {
+        this._options = options
+        this._server = null
+        this._running = false
+        this._connections = {}
+        this._ids = []
+        this._onConnectionHandler = null
+        this._onDisconnectHandler = null
+    }
+
+    public onConnection(handler: function(conn: WebSocketConnection): void): void { this._onConnectionHandler = handler }
+    public onDisconnect(handler: function(conn: WebSocketConnection): void): void { this._onDisconnectHandler = handler }
+
+    public connectionCount(): int {
+        var n: int = 0
+        lock (this) { n = this._ids.length }
+        return n
+    }
+
+    public isRunning(): bool { return this._running }
+
+    // Bind and accept forever. Each accepted client is handshaked and then
+    // serviced on its own spawned task so the accept loop keeps running.
+    public listen(): void {
+        var srv: TcpServer = new TcpServer(this._options.host, this._options.port)
+        this._server = srv
+        this._running = true
+        while (this._running) {
+            var tcp: TcpConnection? = null
+            try {
+                tcp = srv.accept()
+            } catch (e) {
+                if (!this._running) { return }
+                continue
+            }
+            if (tcp != null) {
+                var conn: TcpConnection = tcp
+                spawn this._serveConnection(conn)
+            }
+        }
+    }
+
+    public stop(): void {
+        this._running = false
+        var srv = this._server
+        if (srv != null) {
+            try { srv.close() } catch (e) { }
+        }
+    }
+
+    private _serveConnection(tcp: TcpConnection): void {
+        // 1. Handshake.
+        var head: string = ""
+        try {
+            head = readHttpHead(tcp)
+        } catch (e) {
+            try { tcp.close() } catch (e2) { }
+            return
+        }
+        var req: HttpRequest? = parseHttpRequest(head)
+        if (req == null) { this._rejectHandshake(tcp, 400, "Bad Request"); return }
+        var r: HttpRequest = req
+
+        var key: string = mapGet(r.headers, "sec-websocket-key")
+        var upgrade: string = strings.toLower(mapGet(r.headers, "upgrade"))
+        if (key == "" || upgrade != "websocket") {
+            this._rejectHandshake(tcp, 426, "Upgrade Required"); return
+        }
+        if (this._options.path != "" && r.path != this._options.path) {
+            this._rejectHandshake(tcp, 404, "Not Found"); return
+        }
+
+        var accept: string = computeAcceptKey(key)
+        var resp: string = "HTTP/1.1 101 Switching Protocols\r\n"
+        resp = resp + "Upgrade: websocket\r\n"
+        resp = resp + "Connection: Upgrade\r\n"
+        resp = resp + "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+        try {
+            tcp.writeAll(Buffer.fromString(resp))
+        } catch (e) {
+            try { tcp.close() } catch (e2) { }
+            return
+        }
+
+        // 2. Register the open connection.
+        var id: string = uuid.v4()
+        var conn: WebSocketConnection = new WebSocketConnection(id, tcp)
+        lock (this) {
+            this._connections[id] = conn
+            this._ids.push(id)
+        }
+
+        var onConn = this._onConnectionHandler
+        if (onConn != null) { onConn(conn) }
+
+        // 3. Pump frames until the peer closes or the socket drops.
+        var self: WebSocketServer = this
+        runReadPump(
+            tcp,
+            this._options.maxMessageSize,
+            false,
+            function(): bool { return conn.isOpen() },
+            function(msg: string): void { conn._deliver(msg) },
+            function(): void { },
+            function(): void { conn._firePong() },
+            function(code: int, reason: string, _clean: bool): void {
+                self._removeConnection(id)
+                conn._fireClose(code, reason)
+                try { tcp.close() } catch (e) { }
+            }
+        )
+    }
+
+    private _rejectHandshake(tcp: TcpConnection, code: int, message: string): void {
+        var resp: string = "HTTP/1.1 " + string(code) + " " + message + "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        try { tcp.writeAll(Buffer.fromString(resp)) } catch (e) { }
+        try { tcp.close() } catch (e) { }
+    }
+
+    // Public (not private) so the read-pump close callback can reach it via a
+    // typed `self` — a nested function may only call PUBLIC members through a
+    // captured reference. The `_` prefix marks it internal-by-convention.
+    public _removeConnection(id: string): void {
+        var conn: WebSocketConnection? = null
+        lock (this) {
+            var c: WebSocketConnection? = mapGetConn(this._connections, id)
+            if (c != null) {
+                conn = c
+                this._connections.delete(id)
+                var next: []string = []
+                for (var i: int = 0; i < this._ids.length; i = i + 1) {
+                    if (this._ids[i] != id) { next.push(this._ids[i]) }
+                }
+                this._ids = next
+            }
+        }
+        if (conn != null) {
+            var onDis = this._onDisconnectHandler
+            if (onDis != null) { onDis(conn) }
+        }
+    }
+
+    // Snapshot the live connections under lock, then act outside the lock so
+    // blocking socket writes never serialize the whole server.
+    private _snapshot(): []WebSocketConnection {
+        var out: []WebSocketConnection = []
+        lock (this) {
+            for (var i: int = 0; i < this._ids.length; i = i + 1) {
+                var c: WebSocketConnection? = mapGetConn(this._connections, this._ids[i])
+                if (c != null) { out.push(c) }
+            }
+        }
+        return out
+    }
+
+    // ── Broadcast ──────────────────────────────────────────────────────
+    public broadcast(message: string): void {
+        var conns: []WebSocketConnection = this._snapshot()
+        for (var i: int = 0; i < conns.length; i = i + 1) { conns[i].send(message) }
+    }
+
+    public broadcastJSON(data: any): void { this.broadcast(json.stringify(data)) }
+
+    public broadcastEvent(eventName: string, payload: any): void {
+        this.broadcast(new WebSocketEvent(eventName, payload).serialize())
+    }
+
+    public broadcastExcept(excludeId: string, message: string): void {
+        var conns: []WebSocketConnection = this._snapshot()
+        for (var i: int = 0; i < conns.length; i = i + 1) {
+            if (conns[i].id() != excludeId) { conns[i].send(message) }
+        }
+    }
+
+    public broadcastToRoom(room: string, message: string): void {
+        var conns: []WebSocketConnection = this._snapshot()
+        for (var i: int = 0; i < conns.length; i = i + 1) {
+            if (conns[i].inRoom(room)) { conns[i].send(message) }
+        }
+    }
+
+    public broadcastToRoomExcept(room: string, excludeId: string, message: string): void {
+        var conns: []WebSocketConnection = this._snapshot()
+        for (var i: int = 0; i < conns.length; i = i + 1) {
+            if (conns[i].inRoom(room) && conns[i].id() != excludeId) { conns[i].send(message) }
+        }
+    }
+
+    public closeAll(): void {
+        var conns: []WebSocketConnection = this._snapshot()
+        for (var i: int = 0; i < conns.length; i = i + 1) { conns[i].close(CLOSE_GOING_AWAY, "server shutdown") }
+    }
+}
+
+// ─── WebSocketClient ─────────────────────────────────────────────────────────
+
+@threadSafe
+export class WebSocketClient {
+    var _url: string
+    var _options: WSClientOptions
+    var _tcp: TcpConnection?
+    var _readyState: int
+    var _onOpenHandler: function?(): void
+    var _onMessageHandler: function?(msg: string): void
+    var _onCloseHandler: function?(code: int, reason: string): void
+    var _onErrorHandler: function?(err: string): void
+    var _reconnectTries: int
+
+    constructor(url: string, options: WSClientOptions) {
+        this._url = url
+        this._options = options
+        this._tcp = null
+        this._readyState = STATE_CONNECTING
+        this._onOpenHandler = null
+        this._onMessageHandler = null
+        this._onCloseHandler = null
+        this._onErrorHandler = null
+        this._reconnectTries = 0
+    }
+
+    public readyState(): int { return this._readyState }
+    public isOpen(): bool { return this._readyState == STATE_OPEN }
+
+    public onOpen(handler: function(): void): void { this._onOpenHandler = handler }
+    public onMessage(handler: function(msg: string): void): void { this._onMessageHandler = handler }
+    public onClose(handler: function(code: int, reason: string): void): void { this._onCloseHandler = handler }
+    public onError(handler: function(err: string): void): void { this._onErrorHandler = handler }
+
+    // Connect + perform the upgrade handshake. On success fires onOpen and
+    // spawns the read pump. Throws on handshake failure.
+    public connect(): void {
+        var u: WsUrl = parseWsUrl(this._url)
+        if (u.secure) { throw new Error("wss:// (TLS) not yet supported by chuks_websocket client") }
+
+        this._readyState = STATE_CONNECTING
+        var connHost: string = u.host
+        var connPort: int = u.port
+        var tcp: TcpConnection = new TcpConnection(connHost, connPort, this._options.handshakeTimeoutMs)
+
+        var keyBytes: Buffer = Buffer.fromHex(crypto.randomBytes(16))
+        var clientKey: string = base64.encodeBuffer(keyBytes)
+        var hostHeader: string = u.host + ":" + string(u.port)
+        var req: string = "GET " + u.path + " HTTP/1.1\r\n"
+        req = req + "Host: " + hostHeader + "\r\n"
+        req = req + "Upgrade: websocket\r\n"
+        req = req + "Connection: Upgrade\r\n"
+        req = req + "Sec-WebSocket-Key: " + clientKey + "\r\n"
+        req = req + "Sec-WebSocket-Version: 13\r\n\r\n"
+        tcp.writeAll(Buffer.fromString(req))
+
+        var head: string = readHttpHead(tcp)
+        var lines: []string = strings.split(head, "\r\n")
+        if (lines.length < 1 || strings.indexOf(lines[0], " 101 ") < 0) {
+            try { tcp.close() } catch (e) { }
+            this._readyState = STATE_CLOSED
+            throw new Error("handshake failed: " + (lines.length > 0 ? lines[0] : "no response"))
+        }
+
+        this._tcp = tcp
+        this._readyState = STATE_OPEN
+        this._reconnectTries = 0
+        var onOpen = this._onOpenHandler
+        if (onOpen != null) { onOpen() }
+
+        spawn this._readLoop(tcp)
+    }
+
+    private _readLoop(tcp: TcpConnection): void {
+        var self: WebSocketClient = this
+        runReadPump(
+            tcp,
+            this._options.maxMessageSize,
+            true,
+            function(): bool { return self._readyState == STATE_OPEN },
+            function(msg: string): void {
+                var h = self._onMessageHandler
+                if (h != null) { h(msg) }
+            },
+            function(): void { },
+            function(): void { },
+            function(code: int, reason: string, clean: bool): void {
+                self._readyState = STATE_CLOSED
+                var h = self._onCloseHandler
+                if (h != null) { h(code, reason) }
+                try { tcp.close() } catch (e) { }
+                if (!clean && self._options.autoReconnect) { self._tryReconnect() }
+            }
+        )
+    }
+
+    // Public so the read-pump close callback can reach it via a typed `self`
+    // (a nested function may only call PUBLIC members through a captured ref).
+    public _tryReconnect(): void {
+        if (this._options.maxReconnectTries > 0 && this._reconnectTries >= this._options.maxReconnectTries) { return }
+        this._reconnectTries = this._reconnectTries + 1
+        time.sleep(this._options.reconnectDelayMs)
+        try {
+            this.connect()
+        } catch (e) {
+            var h = this._onErrorHandler
+            if (h != null) { h("reconnect failed: " + string(e)) }
+        }
+    }
+
+    public send(message: string): void {
+        if (this._readyState != STATE_OPEN) { throw new Error("client not open") }
+        var tcp = this._tcp
+        if (tcp == null) { throw new Error("client not connected") }
+        var conn: TcpConnection = tcp
+        lock (this) {
+            sendText(conn, message, true)
+        }
+    }
+
+    public sendJSON(data: any): void { this.send(json.stringify(data)) }
+
+    public emit(eventName: string, payload: any): void {
+        this.send(new WebSocketEvent(eventName, payload).serialize())
+    }
+
+    public ping(): void {
+        if (this._readyState != STATE_OPEN) { return }
+        var tcp = this._tcp
+        if (tcp == null) { return }
+        var conn: TcpConnection = tcp
+        lock (this) {
+            try { sendPing(conn, Buffer.alloc(0), true) } catch (e) { }
+        }
+    }
+
+    public close(code: int, reason: string): void {
+        if (this._readyState != STATE_OPEN) { return }
+        this._readyState = STATE_CLOSING
+        var tcp = this._tcp
+        if (tcp != null) {
+            var conn: TcpConnection = tcp
+            lock (this) {
+                try { sendClose(conn, code, reason, true) } catch (e) { }
+                try { conn.close() } catch (e) { }
+            }
+        }
+        this._readyState = STATE_CLOSED
+    }
+}
+
+// ─── Map helpers ─────────────────────────────────────────────────────────────
+// Typed nullable lookups on the connection registry (the maps store live
+// connections; a removed slot is null).
+
+function mapGet(m: map[string]string, key: string): string {
+    var v: string? = m.get(key)
+    if (v == null) { return "" }
+    return v
+}
+
+function mapGetConn(m: map[string]WebSocketConnection, key: string): WebSocketConnection? {
+    return m.get(key)
+}
+
+// ─── Factory functions ───────────────────────────────────────────────────────
+
+// Create a server from typed options.
+export function createWSServer(options: WSServerOptions): WebSocketServer {
+    return new WebSocketServer(options)
+}
+
+// Connect a client to `url`. Pass null for `options` to use defaults. The
+// returned client is already open (handshake completed) and pumping frames.
+export function connect(url: string, options: WSClientOptions?): WebSocketClient {
+    var opts: WSClientOptions = options != null ? options : new WSClientOptionsBuilder().build()
+    var client: WebSocketClient = new WebSocketClient(url, opts)
+    client.connect()
+    return client
+}
+
+// Build a client without connecting (register handlers first, then .connect()).
+export function createWSClient(url: string, options: WSClientOptions?): WebSocketClient {
+    var opts: WSClientOptions = options != null ? options : new WSClientOptionsBuilder().build()
+    return new WebSocketClient(url, opts)
+}
