@@ -66,6 +66,15 @@ client.onMessage(function(msg: string): void { println(msg) })
 client.connect()
 ```
 
+Both `ws://` and `wss://` (TLS) are supported; a `wss://` URL dials over TLS
+transparently and runs the same handshake and frame codec:
+
+```chuks
+var client = createWSClient("wss://gateway.discord.gg/?v=10&encoding=json", null)
+client.onMessage(function(msg: string): void { println(msg) }) // op 10 Hello, etc.
+client.connect()
+```
+
 ## Configuration
 
 Both server and client take strongly-typed options built with a fluent builder. Every field has a sensible default.
@@ -171,7 +180,7 @@ wss.broadcastEvent("presence", { "online": 12 })
 
 ## Notes & limitations
 
-- **`wss://` (TLS) client** is not yet implemented — `connect("wss://…")` throws. Terminate TLS at a reverse proxy in front of a `ws://` server, or open an issue. (`std/net` provides `TlsConnection`/`TlsServer`, so this is a planned addition.)
+- **`wss://` (TLS) client** is supported — `connect("wss://host/path")` dials over TLS (via `std/net`'s `TlsConnection`) and runs the same RFC 6455 handshake and frame codec transparently. Verified against live `wss://` servers including the Discord gateway. A **TLS-terminating `wss://` server** is not built in; terminate TLS at a reverse proxy in front of a `ws://` server.
 - **Extensions** (`permessage-deflate`) and **subprotocol negotiation** are not implemented.
 - One message is delivered per fragmented sequence; binary frames are delivered as their UTF-8 string form via `onMessage`.
 

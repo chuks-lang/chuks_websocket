@@ -33,7 +33,7 @@ import { time } from "std/time"
 import { uuid } from "std/uuid"
 import { strings } from "std/strings"
 import { Buffer } from "std/buffer"
-import { TcpConnection, TcpServer } from "std/net"
+import { TcpConnection, TlsConnection, TcpServer } from "std/net"
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -842,16 +842,21 @@ export class WebSocketClient {
     // spawns the read pump. Throws on handshake failure.
     public connect(): void {
         var u: WsUrl = parseWsUrl(this._url)
-        if (u.secure) { throw new Error("wss:// (TLS) not yet supported by chuks_websocket client") }
 
         this._readyState = STATE_CONNECTING
         var connHost: string = u.host
         var connPort: int = u.port
-        var tcp: TcpConnection = new TcpConnection(connHost, connPort, this._options.handshakeTimeoutMs)
+        // wss:// runs the same RFC 6455 handshake + frame codec over a TLS
+        // socket. TlsConnection extends TcpConnection, so the read pump and
+        // frame I/O below are unchanged.
+        var tcp: TcpConnection = u.secure ? new TlsConnection(connHost, connPort, null) : new TcpConnection(connHost, connPort, this._options.handshakeTimeoutMs)
 
         var keyBytes: Buffer = Buffer.fromHex(crypto.randomBytes(16))
         var clientKey: string = base64.encodeBuffer(keyBytes)
-        var hostHeader: string = u.host + ":" + string(u.port)
+        // Omit the port from Host when it is the scheme default (some servers,
+        // e.g. Discord, are strict about this).
+        var defaultPort: bool = (u.secure && u.port == 443) || (!u.secure && u.port == 80)
+        var hostHeader: string = defaultPort ? u.host : (u.host + ":" + string(u.port))
         var req: string = "GET " + u.path + " HTTP/1.1\r\n"
         req = req + "Host: " + hostHeader + "\r\n"
         req = req + "Upgrade: websocket\r\n"
