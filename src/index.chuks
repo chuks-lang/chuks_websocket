@@ -908,14 +908,22 @@ export class WebSocketClient {
     // Public so the read-pump close callback can reach it via a typed `self`
     // (a nested function may only call PUBLIC members through a captured ref).
     public _tryReconnect(): void {
-        if (this._options.maxReconnectTries > 0 && this._reconnectTries >= this._options.maxReconnectTries) { return }
-        this._reconnectTries = this._reconnectTries + 1
-        time.sleep(this._options.reconnectDelayMs)
-        try {
-            this.connect()
-        } catch (e) {
-            var h = this._onErrorHandler
-            if (h != null) { h("reconnect failed: " + string(e)) }
+        // Retry (with the configured delay) until we reconnect or exhaust
+        // maxReconnectTries. A single-shot retry gives up if the server is down
+        // for longer than one delay window; looping lets the client ride out a
+        // real outage / network flap and reconnect when the peer returns.
+        while (true) {
+            if (this._options.maxReconnectTries > 0 && this._reconnectTries >= this._options.maxReconnectTries) { return }
+            this._reconnectTries = this._reconnectTries + 1
+            time.sleep(this._options.reconnectDelayMs)
+            try {
+                this.connect()   // on success resets _reconnectTries, fires onOpen, spawns the pump
+                return
+            } catch (e) {
+                var h = this._onErrorHandler
+                if (h != null) { h("reconnect failed: " + string(e)) }
+                // keep looping until connected or tries exhausted
+            }
         }
     }
 

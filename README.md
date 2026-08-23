@@ -108,6 +108,12 @@ var opts = new WSClientOptionsBuilder()
 var client = connect("ws://localhost:8080", opts)
 ```
 
+With `autoReconnect(true)`, an unexpected drop triggers a retry loop: the client
+re-dials every `reconnectDelayMs` and keeps trying until it reconnects or reaches
+`maxReconnectTries` (`0` = unlimited). It therefore survives an outage longer than a
+single delay window, e.g. a server restart or a network flap. On a successful
+reconnect the attempt counter resets and `onOpen` fires again.
+
 ## Rooms & broadcast
 
 The server is `@threadSafe`: connection handlers run on independent tasks, and the connection registry is mutated only under an internal lock. Broadcasts snapshot the live set under the lock, then send outside it so a slow socket never blocks the whole server.
