@@ -37,6 +37,7 @@ import { uuid } from "std/uuid"
 import { strings } from "std/strings"
 import { regex } from "std/regex"
 import { Buffer } from "std/buffer"
+import { Channel } from "std/channel"
 import { Deflater, Inflater } from "std/compress"
 import { TcpConnection, TlsConnection, TcpServer, TlsServer } from "std/net"
 
@@ -70,6 +71,10 @@ export const STATE_CONNECTING = 0
 export const STATE_OPEN = 1
 export const STATE_CLOSING = 2
 export const STATE_CLOSED = 3
+
+// A connection's send queue lets frames already written go once there are this many
+// (and they are at least half of it): see WebSocketConnection._writeLoop.
+const QUEUE_COMPACT = 32
 
 // Magic GUID concatenated with the client key during the handshake (RFC 6455 §4.2.2).
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -991,6 +996,12 @@ export class WebSocketConnection {
     var _qHead: int
     var _buffered: int
     var _writing: bool
+    // The connection's one writer task: started by the first send, it waits on _wake
+    // for more and ends when the connection has closed. (1.2.2 started a task for each
+    // burst of sends, and a native build kept every finished task's context: a busy
+    // server grew by megabytes a second.)
+    var _writerOn: bool
+    var _wake: Channel<bool>
     var _closeQueued: bool
     var _needDrain: bool
     var _highWaterMark: int
@@ -1023,6 +1034,8 @@ export class WebSocketConnection {
         this._qHead = 0
         this._buffered = 0
         this._writing = false
+        this._writerOn = false
+        this._wake = new Channel<bool>(1)
         this._closeQueued = false
         this._needDrain = false
         this._highWaterMark = 1048576
@@ -1054,6 +1067,10 @@ export class WebSocketConnection {
     }
     // Bytes queued for sending and not yet written to the socket.
     public bufferedAmount(): int { var n: int = 0; lock (this) { n = this._buffered } return n }
+    // Frames the send queue holds: those not yet written, and written ones not let go yet.
+    public queuedFrames(): int { var n: int = 0; lock (this) { n = this._queue.length - this._qHead } return n }
+    // Frames it holds in all, written ones included (what the queue keeps in memory).
+    public heldFrames(): int { var n: int = 0; lock (this) { n = this._queue.length } return n }
     // The close code and reason, once the connection has closed (0 and "" before).
     public closeCode(): int { return this._closeCode }
     public closeReason(): string { return this._closeReason }
@@ -1193,8 +1210,9 @@ export class WebSocketConnection {
                         this._messagesSent = this._messagesSent + 1
                         this._lastActivity = time.now()
                     }
-                    if (!this._writing) {
-                        this._writing = true
+                    this._writing = true
+                    if (!this._writerOn) {
+                        this._writerOn = true
                         start = true
                     }
                     if (this._buffered > this._highWaterMark) {
@@ -1210,6 +1228,7 @@ export class WebSocketConnection {
             return false
         }
         if (start) { spawn this._writeLoop() }
+        if (accepted) { this._wake.trySend(true) }
         return accepted && below
     }
 
@@ -1217,6 +1236,7 @@ export class WebSocketConnection {
         while (true) {
             var next: Buffer? = null
             var drained: bool = false
+            var closed: bool = false
             lock (this) {
                 if (this._qHead >= this._queue.length) {
                     this._queue = []
@@ -1226,15 +1246,27 @@ export class WebSocketConnection {
                         this._needDrain = false
                         drained = true
                     }
+                    closed = this._readyState == STATE_CLOSED
                 } else {
                     next = this._queue[this._qHead]
                     this._qHead = this._qHead + 1
+                    // Frames already written are let go: once they are QUEUE_COMPACT or more and
+                    // at least half the queue, it keeps only what is still to send. (The queue was
+                    // only cleared when it ran empty, so a connection that never quite caught up,
+                    // a slow reader under steady sends, held every frame it had sent.)
+                    if (this._qHead >= QUEUE_COMPACT && this._qHead * 2 >= this._queue.length) {
+                        this._queue = this._queue.slice(this._qHead, this._queue.length)
+                        this._qHead = 0
+                    }
                 }
             }
             if (next == null) {
                 var h = this._onDrainHandler
                 if (drained && h != null && this._readyState == STATE_OPEN) { h() }
-                return
+                // Nothing to send: done once closed, else wait for the next send (or the close).
+                if (closed) { return }
+                this._wake.receive()
+                continue
             }
             var frame: Buffer = next
             try {
@@ -1308,6 +1340,8 @@ export class WebSocketConnection {
         this._readyState = STATE_CLOSED
         this._closeCode = c
         this._closeReason = r
+        // The writer, if waiting, sees the close and ends.
+        this._wake.trySend(false)
     }
 
     public _fireClose(): void {

@@ -1,6 +1,6 @@
 {
   "name": "@chuks/websocket",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Production-ready WebSocket client & server for Chuks — pure-Chuks RFC 6455 over std/net TCP: ws:// and wss:// (TLS) client, typed options + builders, @threadSafe broadcast/rooms, text and binary messages, fragmentation, subprotocols, origin checks, wss:// server, send backpressure, permessage-deflate compression, UTF-8 and close-code validation, Autobahn-tested",
   "entry": "src/index.chuks",
   "author": "Chuks Team",
