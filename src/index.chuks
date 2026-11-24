@@ -4,7 +4,9 @@
 // Implements RFC 6455 over std/net TCP primitives: the upgrade handshake
 // (SHA-1 + base64 accept key), full frame codec (FIN/opcode/mask, 7/16/64-bit
 // payload lengths), message fragmentation reassembly, interleaved control
-// frames (ping/pong/close), and the close handshake with status codes.
+// frames (ping/pong/close), the close handshake with status codes, text and
+// binary messages, permessage-deflate, subprotocols, origin checks, wss://
+// serving, and per-connection send queues with backpressure.
 //
 // Design (mirrors chuks_redis): strongly-typed options + fluent builders
 // instead of untyped maps, and a @threadSafe server that serializes mutations
@@ -16,6 +18,7 @@
 //   var wss = new WebSocketServer(new WSServerOptionsBuilder().port(8080).build())
 //   wss.onConnection(function(conn: WebSocketConnection): void {
 //       conn.onMessage(function(msg: string): void { conn.send("echo: " + msg) })
+//       conn.onBinary(function(data: Buffer): void { conn.sendBinary(data) })
 //   })
 //   wss.listen()
 //
@@ -32,8 +35,10 @@ import { base64 } from "std/base64"
 import { time } from "std/time"
 import { uuid } from "std/uuid"
 import { strings } from "std/strings"
+import { regex } from "std/regex"
 import { Buffer } from "std/buffer"
-import { TcpConnection, TlsConnection, TcpServer } from "std/net"
+import { Deflater, Inflater } from "std/compress"
+import { TcpConnection, TlsConnection, TcpServer, TlsServer } from "std/net"
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -122,6 +127,242 @@ export class WSClientOptionsBuilder {
     public build(): WSClientOptions { return this._o }
 }
 
+// ─── permessage-deflate (RFC 7692) ──────────────────────────────────────────
+
+// Compression options, for the server (what it accepts) and the client (what
+// it offers). Build with WSDeflateOptionsBuilder; pass to perMessageDeflate().
+export dataType WSDeflateOptions {
+    threshold:               int;   // messages under this many bytes go uncompressed; default 1024
+    level:                   int;   // 1 (fastest) to 9 (smallest), -1 = 6; default -1
+    serverNoContextTakeover: bool;  // the server compresses each message on its own; default false
+    clientNoContextTakeover: bool;  // the client compresses each message on its own; default false
+    serverMaxWindowBits:     int;   // 8 to 15: the server's window is 2^n bytes; default 15
+    clientMaxWindowBits:     int;   // 8 to 15: the client's window is 2^n bytes; default 15
+}
+
+export class WSDeflateOptionsBuilder {
+    var _o: WSDeflateOptions
+
+    constructor() {
+        this._o = { threshold: 1024, level: -1, serverNoContextTakeover: false, clientNoContextTakeover: false, serverMaxWindowBits: 15, clientMaxWindowBits: 15 }
+    }
+
+    public threshold(bytes: int): WSDeflateOptionsBuilder { this._o.threshold = bytes; return this }
+    public level(n: int): WSDeflateOptionsBuilder { this._o.level = n; return this }
+    public serverNoContextTakeover(on: bool): WSDeflateOptionsBuilder { this._o.serverNoContextTakeover = on; return this }
+    public clientNoContextTakeover(on: bool): WSDeflateOptionsBuilder { this._o.clientNoContextTakeover = on; return this }
+    public serverMaxWindowBits(n: int): WSDeflateOptionsBuilder { this._o.serverMaxWindowBits = n; return this }
+    public clientMaxWindowBits(n: int): WSDeflateOptionsBuilder { this._o.clientMaxWindowBits = n; return this }
+
+    public build(): WSDeflateOptions { return this._o }
+}
+
+// One connection's compression state: our compressor (with the window we
+// agreed to) and the peer's decompressor. Each is reset after every message
+// when its side agreed to no context takeover.
+@threadSafe
+class DeflateContext {
+    var deflater: Deflater
+    var inflater: Inflater
+    var threshold: int
+    var resetOut: bool
+    var resetIn: bool
+    var extension: string
+
+    constructor(level: int, outBits: int, threshold: int, resetOut: bool, resetIn: bool, extension: string) {
+        this.deflater = new Deflater(level, outBits)
+        // The peer promised a window of at most its agreed size; reading
+        // with the largest window accepts that and any smaller one.
+        this.inflater = new Inflater(15)
+        this.threshold = threshold
+        this.resetOut = resetOut
+        this.resetIn = resetIn
+        this.extension = extension
+    }
+
+    // Compress one message (RFC 7692 §7.2.1): sync-flush, then drop the
+    // 00 00 FF FF the flush ends with. Callers hold lock(this) around this
+    // and the queueing of the frame, so frames leave in compression order.
+    public compress(payload: Buffer): Buffer {
+        var head: Buffer = this.deflater.write(payload)
+        var tail: Buffer = this.deflater.flush()
+        var whole: Buffer = Buffer.concat([head, tail])
+        if (this.resetOut) { this.deflater.reset() }
+        var n: int = whole.length() - 4
+        // An empty message compresses to one 0x00 byte (§7.2.3.6).
+        if (n <= 0) { return Buffer.alloc(1) }
+        return whole.slice(0, n)
+    }
+
+    // Inflate one frame of a compressed message, at most `budget` bytes. On
+    // the last frame the 00 00 FF FF tail is put back first (§7.2.2). Throws
+    // on corrupt data or past the budget (std/compress says which).
+    public inflate(payload: Buffer, fin: bool, budget: int): Buffer {
+        var out: Buffer = Buffer.alloc(0)
+        try {
+            this.inflater.write(payload)
+            if (fin) { this.inflater.write(Buffer.fromHex("0000ffff")) }
+            out = this.inflater.read(budget)
+        } catch (e) {
+            this.inflater.reset()
+            throw e
+        }
+        if (fin && this.resetIn) { this.inflater.reset() }
+        return out
+    }
+}
+
+// One extension offer: its name and parameters, in order.
+class ExtOffer {
+    var name: string
+    var keys: []string
+    var values: []string
+    constructor(name: string) { this.name = name; this.keys = []; this.values = [] }
+}
+
+// Parse a Sec-WebSocket-Extensions value: offers separated by ",", each a
+// name and ";"-separated parameters, a value optionally quoted.
+function parseExtensions(header: string): []ExtOffer {
+    var out: []ExtOffer = []
+    var offers: []string = headerTokens(header)
+    for (var i: int = 0; i < offers.length; i = i + 1) {
+        var parts: []string = strings.split(offers[i], ";")
+        var o: ExtOffer = new ExtOffer(strings.toLower(strings.trim(parts[0])))
+        for (var j: int = 1; j < parts.length; j = j + 1) {
+            var p: string = strings.trim(parts[j])
+            if (p == "") { continue }
+            var eq: int = strings.indexOf(p, "=")
+            if (eq < 0) {
+                o.keys.push(strings.toLower(p))
+                o.values.push("")
+            } else {
+                var v: string = strings.trim(strings.substring(p, eq + 1, p.length))
+                if (strings.startsWith(v, "\"") && strings.endsWith(v, "\"") && v.length >= 2) { v = strings.substring(v, 1, v.length - 1) }
+                o.keys.push(strings.toLower(strings.trim(strings.substring(p, 0, eq))))
+                o.values.push(v == "" ? "?" : v)
+            }
+        }
+        out.push(o)
+    }
+    return out
+}
+
+// The permessage-deflate parameters of one offer or response, checked: each
+// at most once, flags without a value, window bits 8 to 15. -1 = absent;
+// a client_max_window_bits without a value reads as 0.
+class DeflateParams {
+    var valid: bool
+    var serverNoCtx: bool
+    var clientNoCtx: bool
+    var serverBits: int
+    var clientBits: int
+    constructor() { this.valid = true; this.serverNoCtx = false; this.clientNoCtx = false; this.serverBits = -1; this.clientBits = -1 }
+}
+
+function windowBitsOf(v: string): int {
+    if (v.length < 1 || v.length > 2) { return -1 }
+    for (var i: int = 0; i < v.length; i = i + 1) {
+        var c: int = v.charCodeAt(i)
+        if (c < 48 || c > 57) { return -1 }
+    }
+    var n: int = int(v)
+    if (n < 8 || n > 15) { return -1 }
+    return n
+}
+
+function deflateParams(o: ExtOffer): DeflateParams {
+    var d: DeflateParams = new DeflateParams()
+    var seen: []string = []
+    for (var i: int = 0; i < o.keys.length; i = i + 1) {
+        var k: string = o.keys[i]
+        var v: string = o.values[i]
+        if (containsString(seen, k)) { d.valid = false; return d }
+        seen.push(k)
+        if (k == "server_no_context_takeover" && v == "") { d.serverNoCtx = true }
+        else if (k == "client_no_context_takeover" && v == "") { d.clientNoCtx = true }
+        else if (k == "server_max_window_bits" && windowBitsOf(v) > 0) { d.serverBits = windowBitsOf(v) }
+        else if (k == "client_max_window_bits" && v == "") { d.clientBits = 0 }
+        else if (k == "client_max_window_bits" && windowBitsOf(v) > 0) { d.clientBits = windowBitsOf(v) }
+        else { d.valid = false; return d }
+    }
+    return d
+}
+
+function minInt(a: int, b: int): int { return a < b ? a : b }
+
+// Server side (RFC 7692 §7.1): accept the first permessage-deflate offer we
+// can, within our options. Returns null to decline (no extension).
+function serverAcceptDeflate(header: string, opts: WSDeflateOptions): DeflateContext? {
+    var offers: []ExtOffer = parseExtensions(header)
+    for (var i: int = 0; i < offers.length; i = i + 1) {
+        if (offers[i].name != "permessage-deflate") { continue }
+        var d: DeflateParams = deflateParams(offers[i])
+        if (!d.valid) { continue }
+        // We can only hold the client to a smaller window if it said it
+        // supports client_max_window_bits.
+        if (d.clientBits < 0 && opts.clientMaxWindowBits < 15) { continue }
+        var serverNoCtx: bool = d.serverNoCtx || opts.serverNoContextTakeover
+        var clientNoCtx: bool = d.clientNoCtx || opts.clientNoContextTakeover
+        var serverBits: int = opts.serverMaxWindowBits
+        if (d.serverBits > 0) { serverBits = minInt(serverBits, d.serverBits) }
+        var resp: string = "permessage-deflate"
+        if (serverNoCtx) { resp = resp + "; server_no_context_takeover" }
+        if (clientNoCtx) { resp = resp + "; client_no_context_takeover" }
+        if (d.serverBits > 0 || serverBits < 15) { resp = resp + "; server_max_window_bits=" + string(serverBits) }
+        if (d.clientBits >= 0) {
+            var clientBits: int = opts.clientMaxWindowBits
+            if (d.clientBits > 0) { clientBits = minInt(clientBits, d.clientBits) }
+            resp = resp + "; client_max_window_bits=" + string(clientBits)
+        }
+        return new DeflateContext(opts.level, serverBits, opts.threshold, serverNoCtx, clientNoCtx, resp)
+    }
+    return null
+}
+
+// Client side: the offer to send.
+function clientDeflateOffer(opts: WSDeflateOptions): string {
+    var offer: string = "permessage-deflate; client_max_window_bits"
+    if (opts.clientMaxWindowBits < 15) { offer = offer + "=" + string(opts.clientMaxWindowBits) }
+    if (opts.serverNoContextTakeover) { offer = offer + "; server_no_context_takeover" }
+    if (opts.clientNoContextTakeover) { offer = offer + "; client_no_context_takeover" }
+    if (opts.serverMaxWindowBits < 15) { offer = offer + "; server_max_window_bits=" + string(opts.serverMaxWindowBits) }
+    return offer
+}
+
+// Client side: check the server's answer against our offer. Returns the
+// context, or null with `failure` set (the handshake must then fail).
+class DeflateAnswer {
+    var ctx: DeflateContext?
+    var failure: string
+    constructor() { this.ctx = null; this.failure = "" }
+}
+
+function clientAcceptDeflate(header: string, opts: WSDeflateOptions): DeflateAnswer {
+    var a: DeflateAnswer = new DeflateAnswer()
+    var offers: []ExtOffer = parseExtensions(header)
+    if (offers.length != 1 || offers[0].name != "permessage-deflate") {
+        a.failure = "server chose an extension the client did not offer"
+        return a
+    }
+    var d: DeflateParams = deflateParams(offers[0])
+    if (!d.valid || d.clientBits == 0) {
+        a.failure = "invalid permessage-deflate response"
+        return a
+    }
+    if (opts.serverNoContextTakeover && !d.serverNoCtx) {
+        a.failure = "server did not accept server_no_context_takeover"
+        return a
+    }
+    if (opts.serverMaxWindowBits < 15 && (d.serverBits < 0 || d.serverBits > opts.serverMaxWindowBits)) {
+        a.failure = "server did not accept server_max_window_bits"
+        return a
+    }
+    var clientBits: int = opts.clientMaxWindowBits
+    if (d.clientBits > 0) { clientBits = minInt(clientBits, d.clientBits) }
+    a.ctx = new DeflateContext(opts.level, clientBits, opts.threshold, d.clientNoCtx || opts.clientNoContextTakeover, d.serverNoCtx, header)
+    return a
+}
+
 // ─── Frame codec (RFC 6455 §5) ───────────────────────────────────────────────
 
 // A single decoded frame.
@@ -129,17 +370,27 @@ class WSFrame {
     var opcode: int
     var payload: Buffer
     var fin: bool
+    var rsv: int
+    var masked: bool
 
-    constructor(opcode: int, payload: Buffer, fin: bool) {
+    constructor(opcode: int, payload: Buffer, fin: bool, rsv: int, masked: bool) {
         this.opcode = opcode
         this.payload = payload
         this.fin = fin
+        this.rsv = rsv
+        this.masked = masked
     }
 }
 
 // Encode a frame. Client→server frames MUST be masked; server→client MUST NOT
 // (RFC 6455 §5.1). Returns a Buffer positioned at offset 0, ready to write.
+// The whole payload is sent whatever its cursor, and the cursor is left alone.
 function buildFrame(opcode: int, payload: Buffer, masked: bool): Buffer {
+    return buildFrameRsv(opcode, payload, masked, false)
+}
+
+// buildFrame with RSV1 set when `compressed` (a permessage-deflate message).
+function buildFrameRsv(opcode: int, payload: Buffer, masked: bool, compressed: bool): Buffer {
     var payloadLen: int = payload.length()
     var headerSize: int = 2
     if (payloadLen >= 126 && payloadLen <= 65535) {
@@ -153,7 +404,7 @@ function buildFrame(opcode: int, payload: Buffer, masked: bool): Buffer {
     var frame: Buffer = Buffer.alloc(headerSize + maskSize + payloadLen)
 
     // Byte 0: FIN (0x80) | opcode.
-    frame.writeUInt8(128 + opcode)
+    frame.writeUInt8(128 + (compressed ? 64 : 0) + opcode)
 
     // Byte 1: MASK bit | length (or 126/127 sentinel for extended length).
     var maskBit: int = 0
@@ -171,21 +422,122 @@ function buildFrame(opcode: int, payload: Buffer, masked: bool): Buffer {
     if (masked) {
         var maskKey: Buffer = Buffer.fromHex(crypto.randomBytes(4))
         frame.writeBytesAll(maskKey)
-        for (var i: int = 0; i < payloadLen; i = i + 1) {
-            frame.writeUInt8(payload.getByte(i) ^ maskKey.getByte(i % 4))
-        }
+        frame.copy(applyMask(payload, maskKey), headerSize + maskSize, 0, payloadLen)
     } else {
-        frame.writeBytesAll(payload)
+        // copy, not writeBytesAll: writeBytesAll starts at the source's
+        // cursor and moves it, so a Buffer the caller filled with write*()
+        // calls (cursor at its end) would go out as zeros.
+        frame.copy(payload, headerSize, 0, payloadLen)
     }
 
     frame.seek(0)
     return frame
 }
 
+// The payload of a close frame: the status code and up to 123 bytes of
+// reason, cut at a character boundary. CLOSE_NO_STATUS sends an empty payload.
+function closePayload(code: int, reason: string): Buffer {
+    if (code == CLOSE_NO_STATUS) { return Buffer.alloc(0) }
+    var reasonBuf: Buffer = Buffer.fromString(reason)
+    var n: int = reasonBuf.length()
+    if (n > 123) {
+        n = 123
+        // Step back over continuation bytes so no character is cut.
+        while (n > 0 && (reasonBuf.getByte(n) & 192) == 128) { n = n - 1 }
+    }
+    var payload: Buffer = Buffer.alloc(2 + n)
+    payload.writeUInt16BE(code)
+    payload.copy(reasonBuf, 2, 0, n)
+    payload.seek(0)
+    return payload
+}
+
+// A close code a peer may send (RFC 6455 §7.4.1 and the IANA registry):
+// 1000-1003, 1007-1014, and the application ranges 3000-4999.
+export function isValidCloseCode(code: int): bool {
+    return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999)
+}
+
+// XOR `payload` with the 4-byte `key` repeated (RFC 6455 §5.3). The key is
+// expanded to the payload's length by doubling copies, then one native xor
+// does the work, so masking costs O(n) native work, not a per-byte loop.
+function applyMask(payload: Buffer, key: Buffer): Buffer {
+    var n: int = payload.length()
+    if (n == 0) { return payload }
+    var expanded: Buffer = Buffer.alloc(n)
+    var filled: int = 4
+    if (n < 4) { filled = n }
+    expanded.copy(key, 0, 0, filled)
+    while (filled < n) {
+        var chunk: int = filled
+        if (chunk > n - filled) { chunk = n - filled }
+        expanded.copy(expanded, filled, 0, chunk)
+        filled = filled + chunk
+    }
+    return payload.xor(expanded)
+}
+
+// ─── UTF-8 validation (RFC 3629) ─────────────────────────────────────────────
+// Incremental, so a text message split over frames is checked frame by frame
+// and fails as soon as an invalid byte arrives. A state of 0 means "at a
+// character boundary"; otherwise it packs the continuation bytes still needed
+// and the allowed range of the next byte. -1 means invalid.
+
+export function utf8Step(buf: Buffer, state: int): int {
+    var s: int = state
+    var n: int = buf.length()
+    for (var i: int = 0; i < n; i = i + 1) {
+        var b: int = buf.getByte(i)
+        if (s == 0) {
+            if (b < 128) { continue }
+            if (b >= 194 && b <= 223) { s = 65536 + 32768 + 191 }
+            else if (b == 224) { s = 131072 + 40960 + 191 }
+            else if ((b >= 225 && b <= 236) || b == 238 || b == 239) { s = 131072 + 32768 + 191 }
+            else if (b == 237) { s = 131072 + 32768 + 159 }
+            else if (b == 240) { s = 196608 + 36864 + 191 }
+            else if (b >= 241 && b <= 243) { s = 196608 + 32768 + 191 }
+            else if (b == 244) { s = 196608 + 32768 + 143 }
+            else { return -1 }
+        } else {
+            var need: int = s >> 16
+            var lo: int = (s >> 8) & 255
+            var hi: int = s & 255
+            if (b < lo || b > hi) { return -1 }
+            need = need - 1
+            if (need == 0) { s = 0 } else { s = (need << 16) + 32768 + 191 }
+        }
+    }
+    return s
+}
+
+// utf8Step with a native fast path. std/regex reads its input as UTF-8 and
+// sees every invalid byte as U+FFFD (Go's regexp rules, on the VM and in
+// native builds alike), so a chunk that starts at a character boundary and
+// has no U+FFFD in it is valid and complete; only the rest (text that really
+// holds U+FFFD, or that is invalid or cut mid-character) is walked byte by byte.
+function utf8Check(buf: Buffer, state: int): int {
+    if (state == 0 && !regex.match("\\x{FFFD}", buf.toStringUtf8())) { return 0 }
+    return utf8Step(buf, state)
+}
+
+// True when `buf` is complete, valid UTF-8.
+export function isValidUtf8(buf: Buffer): bool {
+    return utf8Check(buf, 0) == 0
+}
+
+// Opcode a WSFrame carries when the peer announced a payload that would take
+// the message past maxMessageSize; the payload is not read.
+const FRAME_TOO_LARGE = -2
+// Opcode for a control frame announcing more than 125 bytes; not read either.
+const FRAME_BAD_CONTROL = -3
+
 // Read exactly one frame off the wire, using readExact for every fixed-size
-// field so partial reads can't corrupt the stream. Returns null on EOF, a
-// short read, or an over-size payload (caller should treat null as "closed").
-function readFrameRaw(tcp: TcpConnection, maxMessageSize: int): WSFrame? {
+// field so partial reads can't corrupt the stream. Returns null on EOF or a
+// short read (caller should treat null as "closed"). `pending` is the size
+// of the fragmented message being reassembled: a continuation frame counts on
+// top of it, so the limit applies to the whole message. A frame over the limit
+// comes back with opcode FRAME_TOO_LARGE.
+function readFrameRaw(tcp: TcpConnection, maxMessageSize: int, pending: int, compressed: bool): WSFrame? {
     try {
         var header: Buffer = tcp.readExact(2)
         if (header.length() < 2) { return null }
@@ -193,6 +545,7 @@ function readFrameRaw(tcp: TcpConnection, maxMessageSize: int): WSFrame? {
         var byte1: int = header.getByte(1)
 
         var fin: bool = (byte0 & 128) != 0
+        var rsv: int = (byte0 >> 4) & 7
         var opcode: int = byte0 & 15
         var maskFlag: bool = (byte1 & 128) != 0
         var payloadLen: int = byte1 & 127
@@ -209,7 +562,19 @@ function readFrameRaw(tcp: TcpConnection, maxMessageSize: int): WSFrame? {
             payloadLen = int(ext8.readInt64BE())
         }
 
-        if (payloadLen < 0 || payloadLen > maxMessageSize) { return null }
+        if (payloadLen < 0) { return null }
+        var total: int = payloadLen
+        if (opcode == OPCODE_CONTINUATION) { total = total + pending }
+        // Compressed data is limited after inflating; the frame itself may be
+        // a little larger than the message (incompressible data grows by a
+        // few bytes per block).
+        var limit: int = maxMessageSize
+        if (compressed || (rsv & 4) != 0) { limit = maxMessageSize + maxMessageSize / 100 + 1024 }
+        if (opcode < 8 && total > limit) { return new WSFrame(FRAME_TOO_LARGE, Buffer.alloc(0), fin, rsv, maskFlag) }
+        // A control frame may carry at most 125 bytes (§5.5); the pump rejects
+        // it, and refusing to read a huge one keeps the stream from being used
+        // to make us allocate.
+        if (opcode >= 8 && payloadLen > 125) { return new WSFrame(FRAME_BAD_CONTROL, Buffer.alloc(0), fin, rsv, maskFlag) }
 
         var maskKey: Buffer? = null
         if (maskFlag) {
@@ -224,63 +589,95 @@ function readFrameRaw(tcp: TcpConnection, maxMessageSize: int): WSFrame? {
             if (payload.length() < payloadLen) { return null }
             if (maskFlag && maskKey != null) {
                 var key: Buffer = maskKey
-                for (var i: int = 0; i < payloadLen; i = i + 1) {
-                    payload.setByte(i, payload.getByte(i) ^ key.getByte(i % 4))
-                }
+                payload = applyMask(payload, key)
             }
         }
 
-        return new WSFrame(opcode, payload, fin)
+        return new WSFrame(opcode, payload, fin, rsv, maskFlag)
     } catch (e) {
         return null
     }
 }
 
-function sendFrame(tcp: TcpConnection, opcode: int, payload: Buffer, masked: bool): void {
-    tcp.writeAll(buildFrame(opcode, payload, masked))
-}
-
-function sendText(tcp: TcpConnection, message: string, masked: bool): void {
-    sendFrame(tcp, OPCODE_TEXT, Buffer.fromString(message), masked)
-}
-
-function sendPing(tcp: TcpConnection, payload: Buffer, masked: bool): void {
-    sendFrame(tcp, OPCODE_PING, payload, masked)
-}
-
-function sendPong(tcp: TcpConnection, payload: Buffer, masked: bool): void {
-    sendFrame(tcp, OPCODE_PONG, payload, masked)
-}
-
-function sendClose(tcp: TcpConnection, code: int, reason: string, masked: bool): void {
-    var reasonBuf: Buffer = Buffer.fromString(reason)
-    var payload: Buffer = Buffer.alloc(2 + reasonBuf.length())
-    payload.writeUInt16BE(code)
-    payload.writeBytesAll(reasonBuf)
-    sendFrame(tcp, OPCODE_CLOSE, payload, masked)
+// Read and discard input after we sent a close frame, until the peer's close
+// frame, the end of the stream, or two seconds. When the stream is out of step
+// (`raw`: an over-size frame was left unread) it is read as plain bytes, for at
+// most half a second and 4 MiB, since no close frame can be found in it. Closing a socket with unread input makes the OS reset it, and a
+// reset can destroy our close frame before the peer reads it.
+function drainAfterClose(tcp: TcpConnection, raw: bool): void {
+    try {
+        tcp.setReadDeadline(raw ? 500 : 2000)
+        if (raw) {
+            var drained: int = 0
+            while (drained < 4194304) {
+                var chunk: Buffer = tcp.read(65536)
+                if (chunk.length() == 0) { return }
+                drained = drained + chunk.length()
+            }
+            return
+        }
+        for (var i: int = 0; i < 64; i = i + 1) {
+            var f: WSFrame? = readFrameRaw(tcp, 16777216, 0, false)
+            if (f == null) { return }
+            var fr: WSFrame = f
+            if (fr.opcode == OPCODE_CLOSE) { return }
+        }
+    } catch (e) { }
 }
 
 // ─── Read pump (fragmentation + control frames) ──────────────────────────────
-// Drives a connection's read side: reassembles fragmented data messages,
-// auto-responds to ping with pong, and handles the close handshake. Delivered
-// text is handed to onMessage; the loop returns when the peer closes, the
-// socket drops, or isOpen() goes false. `masked` is the masking to apply to
-// our OUTBOUND control frames (client=true, server=false).
+// Drives a connection's read side: checks every frame against RFC 6455,
+// reassembles fragmented data messages, answers ping with pong, and runs the
+// close handshake. Each whole message is handed to onData with its kind
+// (binary or text) and its bytes. Frames we send from here (pong, close) go
+// through `write`, which the owner serializes with its own sends.
+//
+// `isServer`: the server expects masked frames and sends unmasked ones; the
+// client the reverse. `state()` is the owner's ready state: the pump runs
+// until it is CLOSED, and a close frame that arrives while it is CLOSING is
+// the peer's answer to ours. onClose receives the code and reason and whether
+// the close handshake completed; `fail` tells the owner the stream should be
+// drained before the socket is closed.
+class PumpConfig {
+    var maxMessageSize: int
+    var readTimeoutMs: int
+    var isServer: bool
+    var validateUtf8: bool
+    var deflate: DeflateContext?
+    constructor(maxMessageSize: int, readTimeoutMs: int, isServer: bool, validateUtf8: bool, deflate: DeflateContext?) {
+        this.maxMessageSize = maxMessageSize
+        this.readTimeoutMs = readTimeoutMs
+        this.isServer = isServer
+        this.validateUtf8 = validateUtf8
+        this.deflate = deflate
+    }
+}
+
 function runReadPump(
     tcp: TcpConnection,
-    maxMessageSize: int,
-    masked: bool,
-    isOpen: function(): bool,
-    onMessage: function(msg: string): void,
+    cfg: PumpConfig,
+    state: function(): int,
+    write: function(frame: Buffer, isClose: bool): void,
+    onData: function(binary: bool, payload: Buffer): void,
     onPing: function(): void,
     onPong: function(): void,
     onClose: function(code: int, reason: string, clean: bool): void
 ): void {
+    var masked: bool = !cfg.isServer
     var fragOpcode: int = -1
     var fragParts: []Buffer = []
+    var fragBytes: int = 0
+    var inflated: int = 0
+    var utf8State: int = 0
+    var msgCompressed: bool = false
 
-    while (isOpen()) {
-        var frame: WSFrame? = readFrameRaw(tcp, maxMessageSize)
+    while (state() != STATE_CLOSED) {
+        // Each frame must arrive within readTimeoutMs (0: wait for ever); a
+        // read past the deadline fails, and the connection closes as lost.
+        if (cfg.readTimeoutMs > 0) {
+            tcp.setReadDeadline(cfg.readTimeoutMs)
+        }
+        var frame: WSFrame? = readFrameRaw(tcp, cfg.maxMessageSize, fragBytes, msgCompressed)
         if (frame == null) {
             onClose(CLOSE_ABNORMAL, "connection lost", false)
             return
@@ -288,47 +685,129 @@ function runReadPump(
         var f: WSFrame = frame
         var op: int = f.opcode
 
-        if (op == OPCODE_PING) {
-            try { sendPong(tcp, f.payload, masked) } catch (e) { /* peer gone */ }
+        // Fail the connection: our close frame, drain, then the owner's close.
+        var failCode: int = 0
+        var failReason: string = ""
+        if (op == FRAME_TOO_LARGE) {
+            failCode = CLOSE_TOO_LARGE; failReason = "message too big"
+        } else if (f.rsv != 0 && !(f.rsv == 4 && cfg.deflate != null && (op == OPCODE_TEXT || op == OPCODE_BINARY))) {
+            // RSV1 marks a compressed message, only on its first frame and
+            // only when permessage-deflate was agreed (RFC 7692 §6).
+            failCode = CLOSE_PROTOCOL_ERROR; failReason = "reserved bits set"
+        } else if (f.masked != cfg.isServer) {
+            failCode = CLOSE_PROTOCOL_ERROR
+            failReason = cfg.isServer ? "client frame not masked" : "server frame masked"
+        } else if (op == FRAME_BAD_CONTROL || (op >= 8 && !f.fin)) {
+            failCode = CLOSE_PROTOCOL_ERROR; failReason = "invalid control frame"
+        } else if ((op >= 3 && op <= 7) || op >= 11) {
+            failCode = CLOSE_PROTOCOL_ERROR; failReason = "unknown opcode"
+        }
+
+        if (failCode == 0 && op == OPCODE_PING) {
+            if (state() == STATE_OPEN) {
+                try { write(buildFrame(OPCODE_PONG, f.payload, masked), false) } catch (e) { /* peer gone */ }
+            }
             onPing()
-        } else if (op == OPCODE_PONG) {
+            continue
+        }
+        if (failCode == 0 && op == OPCODE_PONG) {
             onPong()
-        } else if (op == OPCODE_CLOSE) {
+            continue
+        }
+        if (failCode == 0 && op == OPCODE_CLOSE) {
             var code: int = CLOSE_NO_STATUS
             var reason: string = ""
-            if (f.payload.length() >= 2) {
+            var n: int = f.payload.length()
+            if (n == 1) {
+                failCode = CLOSE_PROTOCOL_ERROR; failReason = "invalid close payload"
+            } else if (n >= 2) {
                 f.payload.seek(0)
                 code = f.payload.readUInt16BE()
-                if (f.payload.remaining() > 0) {
-                    reason = f.payload.readString(f.payload.remaining())
+                var reasonBuf: Buffer = f.payload.slice(2, n)
+                if (!isValidCloseCode(code)) {
+                    failCode = CLOSE_PROTOCOL_ERROR; failReason = "invalid close code"
+                } else if (!isValidUtf8(reasonBuf)) {
+                    failCode = CLOSE_INVALID_PAYLOAD; failReason = "close reason is not UTF-8"
+                } else {
+                    reason = reasonBuf.toStringUtf8()
                 }
             }
-            try { sendClose(tcp, code, reason, masked) } catch (e) { /* peer gone */ }
-            onClose(code, reason, true)
-            return
-        } else if (op == OPCODE_TEXT || op == OPCODE_BINARY) {
-            if (f.fin) {
-                // Single, unfragmented message — the common case.
-                onMessage(f.payload.toStringUtf8())
-            } else {
-                // Start of a fragmented message; remember the data opcode.
-                fragOpcode = op
-                fragParts = [f.payload]
-            }
-        } else if (op == OPCODE_CONTINUATION) {
-            if (fragOpcode == -1) {
-                // Continuation without an initial frame — protocol error.
-                try { sendClose(tcp, CLOSE_PROTOCOL_ERROR, "unexpected continuation", masked) } catch (e) { }
-                onClose(CLOSE_PROTOCOL_ERROR, "unexpected continuation", false)
+            if (failCode == 0) {
+                if (state() == STATE_OPEN) {
+                    // The peer started the close: answer with its code.
+                    try { write(buildFrame(OPCODE_CLOSE, closePayload(code, ""), masked), true) } catch (e) { }
+                }
+                onClose(code, reason, true)
                 return
             }
-            fragParts.push(f.payload)
-            if (f.fin) {
-                var whole: Buffer = Buffer.concat(fragParts)
-                onMessage(whole.toStringUtf8())
-                fragOpcode = -1
-                fragParts = []
+        }
+
+        if (failCode == 0 && (op == OPCODE_TEXT || op == OPCODE_BINARY || op == OPCODE_CONTINUATION)) {
+            var first: bool = op != OPCODE_CONTINUATION
+            if (first && fragOpcode != -1) {
+                // A new message may not start inside a fragmented one (§5.4).
+                failCode = CLOSE_PROTOCOL_ERROR; failReason = "expected continuation"
+            } else if (!first && fragOpcode == -1) {
+                failCode = CLOSE_PROTOCOL_ERROR; failReason = "unexpected continuation"
+            } else {
+                if (first) {
+                    fragOpcode = op
+                    fragParts = []
+                    fragBytes = 0
+                    inflated = 0
+                    utf8State = 0
+                    msgCompressed = (f.rsv & 4) != 0
+                }
+                // The message's bytes in this frame: the payload, or for a
+                // compressed message what it inflates to, within what is
+                // left of maxMessageSize (so a small bomb cannot grow).
+                var chunk: Buffer = f.payload
+                var dc: DeflateContext? = cfg.deflate
+                if (msgCompressed && dc != null) {
+                    var ctx: DeflateContext = dc
+                    try {
+                        chunk = ctx.inflate(f.payload, f.fin, cfg.maxMessageSize - inflated)
+                    } catch (e) {
+                        if (strings.contains(string(e), "exceeds maxOutput")) {
+                            failCode = CLOSE_TOO_LARGE; failReason = "message too big"
+                        } else {
+                            failCode = CLOSE_INVALID_PAYLOAD; failReason = "invalid compressed data"
+                        }
+                    }
+                }
+                if (failCode == 0 && fragOpcode == OPCODE_TEXT && cfg.validateUtf8) {
+                    utf8State = utf8Check(chunk, utf8State)
+                    if (utf8State == -1 || (f.fin && utf8State != 0)) {
+                        failCode = CLOSE_INVALID_PAYLOAD; failReason = "text is not UTF-8"
+                    }
+                }
+                if (failCode == 0) {
+                    fragParts.push(chunk)
+                    fragBytes = fragBytes + f.payload.length()
+                    inflated = inflated + chunk.length()
+                    if (f.fin) {
+                        var whole: Buffer = fragParts.length == 1 ? fragParts[0] : Buffer.concat(fragParts)
+                        var wasBinary: bool = fragOpcode == OPCODE_BINARY
+                        fragOpcode = -1
+                        fragParts = []
+                        fragBytes = 0
+                        inflated = 0
+                        utf8State = 0
+                        msgCompressed = false
+                        if (state() == STATE_OPEN) { onData(wasBinary, whole) }
+                    }
+                }
             }
+        }
+
+        if (failCode != 0) {
+            if (state() == STATE_OPEN) {
+                try { write(buildFrame(OPCODE_CLOSE, closePayload(failCode, failReason), masked), true) } catch (e) { }
+            }
+            // After a bad close frame the peer has nothing more to send.
+            if (op != OPCODE_CLOSE) { drainAfterClose(tcp, op == FRAME_TOO_LARGE || op == FRAME_BAD_CONTROL) }
+            onClose(failCode, failReason, false)
+            return
         }
     }
 }
@@ -361,34 +840,63 @@ function readHttpHead(tcp: TcpConnection): string {
     return acc
 }
 
-class HttpRequest {
-    var method: string
-    var path: string
+// A parsed request or response head. Header names are lower-cased; a header
+// sent on several lines is joined with ", " (RFC 7230 §3.2.2).
+class HttpHead {
+    var startLine: []string
     var headers: map[string]string
-    constructor(method: string, path: string, headers: map[string]string) {
-        this.method = method
-        this.path = path
+    constructor(startLine: []string, headers: map[string]string) {
+        this.startLine = startLine
         this.headers = headers
     }
+    public header(name: string): string { return mapGet(this.headers, name) }
 }
 
-function parseHttpRequest(raw: string): HttpRequest? {
+function parseHttpHead(raw: string): HttpHead? {
     var lines: []string = strings.split(raw, "\r\n")
     if (lines.length < 1) { return null }
-    var requestLine: []string = strings.split(lines[0], " ")
-    if (requestLine.length < 3) { return null }
+    var startLine: []string = strings.split(lines[0], " ")
+    if (startLine.length < 2) { return null }
     var headers: map[string]string = {}
     for (var i: int = 1; i < lines.length; i = i + 1) {
         var line: string = lines[i]
         if (line == "") { break }
-        var colonIdx: int = strings.indexOf(line, ": ")
+        var colonIdx: int = strings.indexOf(line, ":")
         if (colonIdx > 0) {
-            var key: string = strings.toLower(strings.substring(line, 0, colonIdx))
-            var value: string = strings.substring(line, colonIdx + 2, line.length)
-            headers[key] = value
+            var key: string = strings.toLower(strings.trim(strings.substring(line, 0, colonIdx)))
+            var value: string = strings.trim(strings.substring(line, colonIdx + 1, line.length))
+            var prev: string = mapGet(headers, key)
+            headers[key] = prev == "" ? value : prev + ", " + value
         }
     }
-    return new HttpRequest(requestLine[0], requestLine[1], headers)
+    return new HttpHead(startLine, headers)
+}
+
+// The comma-separated tokens of a header value, trimmed.
+function headerTokens(value: string): []string {
+    var out: []string = []
+    if (value == "") { return out }
+    var parts: []string = strings.split(value, ",")
+    for (var i: int = 0; i < parts.length; i = i + 1) {
+        var t: string = strings.trim(parts[i])
+        if (t != "") { out.push(t) }
+    }
+    return out
+}
+
+function hasTokenCI(value: string, token: string): bool {
+    var toks: []string = headerTokens(value)
+    for (var i: int = 0; i < toks.length; i = i + 1) {
+        if (strings.toLower(toks[i]) == token) { return true }
+    }
+    return false
+}
+
+function containsString(list: []string, s: string): bool {
+    for (var i: int = 0; i < list.length; i = i + 1) {
+        if (list[i] == s) { return true }
+    }
+    return false
 }
 
 class WsUrl {
@@ -452,9 +960,13 @@ export class WebSocketEvent {
 }
 
 // ─── WebSocketConnection ─────────────────────────────────────────────────────
-// One server-side client connection. @threadSafe: send() may be called from
-// the connection's own read pump and from broadcast loops on other tasks, so
-// writes are serialized with lock(this).
+// One server-side client connection. Sends never block the caller: each frame
+// joins the connection's send queue, and one writer task per connection
+// drains it, so a slow peer holds up only its own queue (never a broadcast or
+// the read pump). bufferedAmount() is the queued byte count; send() returns
+// false once it passes the server's high-water mark, and onDrain fires when
+// the queue empties again. A queue that would pass maxBufferedBytes, or a
+// write that takes longer than writeTimeoutMs, closes the connection (1008).
 
 @threadSafe
 export class WebSocketConnection {
@@ -463,14 +975,32 @@ export class WebSocketConnection {
     var _readyState: int
     var _rooms: []string
     var _data: map[string]any
+    var _protocol: string
     var _onMessageHandler: function?(msg: string): void
+    var _onBinaryHandler: function?(data: Buffer): void
     var _onCloseHandler: function?(code: int, reason: string): void
     var _onErrorHandler: function?(err: string): void
     var _onPongHandler: function?(): void
+    var _onDrainHandler: function?(): void
     var _createdAt: int
     var _lastActivity: int
     var _messagesSent: int
     var _messagesReceived: int
+    // Send queue.
+    var _queue: []Buffer
+    var _qHead: int
+    var _buffered: int
+    var _writing: bool
+    var _closeQueued: bool
+    var _needDrain: bool
+    var _highWaterMark: int
+    var _maxBuffered: int
+    var _writeTimeoutMs: int
+    var _closeCode: int
+    var _closeReason: string
+    var _abortCode: int
+    var _abortReason: string
+    var _deflate: DeflateContext?
 
     constructor(connectionId: string, tcp: TcpConnection) {
         this._id = connectionId
@@ -478,14 +1008,31 @@ export class WebSocketConnection {
         this._readyState = STATE_OPEN
         this._rooms = []
         this._data = {}
+        this._protocol = ""
         this._onMessageHandler = null
+        this._onBinaryHandler = null
         this._onCloseHandler = null
         this._onErrorHandler = null
         this._onPongHandler = null
+        this._onDrainHandler = null
         this._createdAt = time.now()
         this._lastActivity = time.now()
         this._messagesSent = 0
         this._messagesReceived = 0
+        this._queue = []
+        this._qHead = 0
+        this._buffered = 0
+        this._writing = false
+        this._closeQueued = false
+        this._needDrain = false
+        this._highWaterMark = 1048576
+        this._maxBuffered = 67108864
+        this._writeTimeoutMs = 0
+        this._closeCode = 0
+        this._closeReason = ""
+        this._abortCode = 0
+        this._abortReason = ""
+        this._deflate = null
     }
 
     public id(): string { return this._id }
@@ -496,77 +1043,239 @@ export class WebSocketConnection {
     public sentCount(): int { return this._messagesSent }
     public receivedCount(): int { return this._messagesReceived }
     public remoteAddr(): string { return this._tcp.remoteAddr() }
+    // The subprotocol agreed in the handshake ("" when none).
+    public protocol(): string { return this._protocol }
+    // The extensions agreed in the handshake, as the response header gave
+    // them (e.g. "permessage-deflate; client_max_window_bits=15"), or "".
+    public extensions(): string {
+        var dc = this._deflate
+        if (dc == null) { return "" }
+        return dc.extension
+    }
+    // Bytes queued for sending and not yet written to the socket.
+    public bufferedAmount(): int { var n: int = 0; lock (this) { n = this._buffered } return n }
+    // The close code and reason, once the connection has closed (0 and "" before).
+    public closeCode(): int { return this._closeCode }
+    public closeReason(): string { return this._closeReason }
 
-    // Per-connection scratch data (userId, session, …).
-    public set(key: string, value: any): void { this._data[key] = value }
-    public get(key: string): any { return this._data[key] }
+    // Per-connection scratch data (userId, session, …). Locked: it is read and written
+    // from more than one task (the reader, the server's sweeps and handlers); unlocked,
+    // a read racing a write stopped a game server. The map's own lock, not the
+    // connection's: send holds that one while it reports an error to a handler, which
+    // may read this data (a lock taken twice by one task would never be released).
+    public set(key: string, value: any): void { lock (this._data) { this._data[key] = value } }
+    public get(key: string): any {
+        var v: any = null
+        lock (this._data) { v = this._data[key] }
+        return v
+    }
     public rooms(): []string { return this._rooms }
 
-    // Send a text message (server frames are never masked).
-    public send(message: string): void {
-        if (this._readyState != STATE_OPEN) { return }
-        lock (this) {
-            try {
-                sendText(this._tcp, message, false)
-                this._messagesSent = this._messagesSent + 1
-                this._lastActivity = time.now()
-            } catch (e) {
-                this._fireError("send failed: " + string(e))
-            }
-        }
+    // Send a text message (server frames are never masked). Returns false when
+    // the connection is not open or its send queue is past the high-water mark
+    // (the message is still queued in that case; wait for onDrain).
+    public send(message: string): bool {
+        return this._sendMessage(OPCODE_TEXT, Buffer.fromString(message), null)
     }
 
-    public sendJSON(data: any): void { this.send(json.stringify(data)) }
+    // Send a binary message: the bytes travel as one binary frame (opcode 2),
+    // unchanged, never as text. Returns as send() does.
+    public sendBinary(data: Buffer): bool {
+        return this._sendMessage(OPCODE_BINARY, data, null)
+    }
 
-    public emit(eventName: string, payload: any): void {
-        this.send(new WebSocketEvent(eventName, payload).serialize())
+    // Queue one data message. With permessage-deflate and a message at or
+    // over the threshold it is compressed (RSV1); compressing and queueing
+    // happen under the context's lock, so frames leave in the order the
+    // compressor saw them. `plain` is the uncompressed frame when the caller
+    // (a broadcast) already built it for every connection.
+    public _sendMessage(opcode: int, payload: Buffer, plain: Buffer?): bool {
+        var dc = this._deflate
+        if (dc != null && payload.length() >= dc.threshold) {
+            var ctx: DeflateContext = dc
+            var ok: bool = false
+            lock (ctx) {
+                if (this._readyState == STATE_OPEN) {
+                    ok = this._enqueue(buildFrameRsv(opcode, ctx.compress(payload), false, true), false, true)
+                }
+            }
+            return ok
+        }
+        if (plain != null) { return this._enqueue(plain, false, true) }
+        return this._enqueue(buildFrame(opcode, payload, false), false, true)
+    }
+
+    public sendJSON(data: any): bool { return this.send(json.stringify(data)) }
+
+    public emit(eventName: string, payload: any): bool {
+        return this.send(new WebSocketEvent(eventName, payload).serialize())
     }
 
     public ping(): void {
-        if (this._readyState != STATE_OPEN) { return }
-        lock (this) {
-            try { sendPing(this._tcp, Buffer.alloc(0), false) } catch (e) { this._fireError("ping failed: " + string(e)) }
-        }
+        this._enqueue(buildFrame(OPCODE_PING, Buffer.alloc(0), false), false, false)
     }
 
+    // Start the close handshake: our close frame goes out after everything
+    // already queued, and the socket closes when the peer answers (or after
+    // five seconds). code must be one a peer may receive (see
+    // isValidCloseCode) or CLOSE_NO_STATUS; the reason is cut to 123 bytes.
     public close(code: int, reason: string): void {
-        if (this._readyState == STATE_CLOSED || this._readyState == STATE_CLOSING) { return }
+        if (code != CLOSE_NO_STATUS && !isValidCloseCode(code)) {
+            throw new Error("invalid close code " + string(code))
+        }
+        if (this._readyState != STATE_OPEN) { return }
         this._readyState = STATE_CLOSING
-        lock (this) {
-            try { sendClose(this._tcp, code, reason, false) } catch (e) { }
+        this._closeCode = code
+        this._closeReason = reason
+        this._enqueue(buildFrame(OPCODE_CLOSE, closePayload(code, reason), false), true, false)
+        spawn this._closeTimer(5000)
+    }
+
+    public _closeTimer(ms: int): void {
+        time.sleep(ms)
+        if (this._readyState != STATE_CLOSED) {
             try { this._tcp.close() } catch (e) { }
         }
-        this._readyState = STATE_CLOSED
     }
 
     // ── Rooms ──────────────────────────────────────────────────────────
     public join(room: string): void {
-        for (var i: int = 0; i < this._rooms.length; i = i + 1) {
-            if (this._rooms[i] == room) { return }
+        lock (this) {
+            if (!containsString(this._rooms, room)) { this._rooms.push(room) }
         }
-        this._rooms.push(room)
     }
 
     public leave(room: string): void {
-        var next: []string = []
-        for (var i: int = 0; i < this._rooms.length; i = i + 1) {
-            if (this._rooms[i] != room) { next.push(this._rooms[i]) }
+        lock (this) {
+            var next: []string = []
+            for (var i: int = 0; i < this._rooms.length; i = i + 1) {
+                if (this._rooms[i] != room) { next.push(this._rooms[i]) }
+            }
+            this._rooms = next
         }
-        this._rooms = next
     }
 
     public inRoom(room: string): bool {
-        for (var i: int = 0; i < this._rooms.length; i = i + 1) {
-            if (this._rooms[i] == room) { return true }
-        }
-        return false
+        var found: bool = false
+        lock (this) { found = containsString(this._rooms, room) }
+        return found
     }
 
     // ── Handlers ───────────────────────────────────────────────────────
     public onMessage(handler: function(msg: string): void): void { this._onMessageHandler = handler }
+    // Binary messages arrive here as their exact bytes. Without an onBinary
+    // handler a binary message goes to onMessage as a string, as in 1.1.
+    public onBinary(handler: function(data: Buffer): void): void { this._onBinaryHandler = handler }
     public onClose(handler: function(code: int, reason: string): void): void { this._onCloseHandler = handler }
     public onError(handler: function(err: string): void): void { this._onErrorHandler = handler }
     public onPong(handler: function(): void): void { this._onPongHandler = handler }
+    // Fires when the send queue empties after send() returned false.
+    public onDrain(handler: function(): void): void { this._onDrainHandler = handler }
+
+    // ── Send queue ─────────────────────────────────────────────────────
+    // `isClose`: the close frame; nothing is queued after it. `counts`: a
+    // data message (counted in sentCount, subject to maxBufferedBytes).
+    public _enqueue(frame: Buffer, isClose: bool, counts: bool): bool {
+        var start: bool = false
+        var accepted: bool = false
+        var below: bool = true
+        var overflow: bool = false
+        lock (this) {
+            var open: bool = this._readyState == STATE_OPEN || (isClose && this._readyState == STATE_CLOSING)
+            if (open && !this._closeQueued) {
+                if (counts && this._maxBuffered > 0 && this._buffered + frame.length() > this._maxBuffered) {
+                    overflow = true
+                } else {
+                    this._queue.push(frame)
+                    this._buffered = this._buffered + frame.length()
+                    if (isClose) { this._closeQueued = true }
+                    if (counts) {
+                        this._messagesSent = this._messagesSent + 1
+                        this._lastActivity = time.now()
+                    }
+                    if (!this._writing) {
+                        this._writing = true
+                        start = true
+                    }
+                    if (this._buffered > this._highWaterMark) {
+                        this._needDrain = true
+                        below = false
+                    }
+                    accepted = true
+                }
+            }
+        }
+        if (overflow) {
+            this._abort(CLOSE_POLICY_VIOLATION, "send buffer overflow")
+            return false
+        }
+        if (start) { spawn this._writeLoop() }
+        return accepted && below
+    }
+
+    public _writeLoop(): void {
+        while (true) {
+            var next: Buffer? = null
+            var drained: bool = false
+            lock (this) {
+                if (this._qHead >= this._queue.length) {
+                    this._queue = []
+                    this._qHead = 0
+                    this._writing = false
+                    if (this._needDrain) {
+                        this._needDrain = false
+                        drained = true
+                    }
+                } else {
+                    next = this._queue[this._qHead]
+                    this._qHead = this._qHead + 1
+                }
+            }
+            if (next == null) {
+                var h = this._onDrainHandler
+                if (drained && h != null && this._readyState == STATE_OPEN) { h() }
+                return
+            }
+            var frame: Buffer = next
+            try {
+                if (this._writeTimeoutMs > 0) { this._tcp.setWriteDeadline(this._writeTimeoutMs) }
+                this._tcp.writeAll(frame)
+            } catch (e) {
+                if (this._readyState == STATE_OPEN) {
+                    this._fireError("send failed: " + string(e))
+                    this._abort(CLOSE_POLICY_VIOLATION, "write timed out or failed")
+                }
+                lock (this) {
+                    this._queue = []
+                    this._qHead = 0
+                    this._buffered = 0
+                    this._writing = false
+                }
+                return
+            }
+            lock (this) { this._buffered = this._buffered - frame.length() }
+        }
+    }
+
+    // Drop the connection without a close handshake: the socket closes, the
+    // read pump ends, and onClose reports `code`.
+    public _abort(code: int, reason: string): void {
+        lock (this) {
+            if (this._abortCode == 0) {
+                this._abortCode = code
+                this._abortReason = reason
+            }
+        }
+        try { this._tcp.close() } catch (e) { }
+    }
+
+    public _configure(highWaterMark: int, maxBuffered: int, writeTimeoutMs: int, protocol: string, deflate: DeflateContext?): void {
+        this._deflate = deflate
+        this._highWaterMark = highWaterMark
+        this._maxBuffered = maxBuffered
+        this._writeTimeoutMs = writeTimeoutMs
+        this._protocol = protocol
+    }
 
     // ── Internal dispatch (called by the server read pump) ─────────────
     public _deliver(message: string): void {
@@ -576,10 +1285,34 @@ export class WebSocketConnection {
         if (h != null) { h(message) }
     }
 
-    public _fireClose(code: int, reason: string): void {
+    public _deliverBinary(data: Buffer): void {
+        var hb = this._onBinaryHandler
+        if (hb == null) {
+            this._deliver(data.toStringUtf8())
+            return
+        }
+        this._messagesReceived = this._messagesReceived + 1
+        this._lastActivity = time.now()
+        hb(data)
+    }
+
+    // Record the close (an abort's own code wins), so closeCode() is right
+    // inside onDisconnect, which runs before onClose as in 1.1.
+    public _markClosed(code: int, reason: string): void {
+        var c: int = code
+        var r: string = reason
+        if (this._abortCode != 0) {
+            c = this._abortCode
+            r = this._abortReason
+        }
         this._readyState = STATE_CLOSED
+        this._closeCode = c
+        this._closeReason = r
+    }
+
+    public _fireClose(): void {
         var h = this._onCloseHandler
-        if (h != null) { h(code, reason) }
+        if (h != null) { h(this._closeCode, this._closeReason) }
     }
 
     public _firePong(): void {
@@ -587,7 +1320,7 @@ export class WebSocketConnection {
         if (h != null) { h() }
     }
 
-    private _fireError(err: string): void {
+    public _fireError(err: string): void {
         var h = this._onErrorHandler
         if (h != null) { h(err) }
     }
@@ -596,6 +1329,9 @@ export class WebSocketConnection {
 }
 
 // ─── WebSocketServer ─────────────────────────────────────────────────────────
+// Options that came after 1.1 are set with chainable methods on the server
+// (protocols, origins, TLS, send queue limits, UTF-8 checking), so the
+// WSServerOptions record and its builder stay exactly as they were.
 
 @threadSafe
 export class WebSocketServer {
@@ -609,6 +1345,17 @@ export class WebSocketServer {
     var _ids: []string
     var _onConnectionHandler: function?(conn: WebSocketConnection): void
     var _onDisconnectHandler: function?(conn: WebSocketConnection): void
+    var _protocols: []string
+    var _protocolSelector: function?(offered: []string): string
+    var _requireProtocol: bool
+    var _origins: []string
+    var _originCheck: function?(origin: string): bool
+    var _tlsOptions: any
+    var _highWaterMark: int
+    var _maxBuffered: int
+    var _writeTimeoutMs: int
+    var _validateUtf8: bool
+    var _deflateOpts: WSDeflateOptions?
 
     constructor(options: WSServerOptions) {
         this._options = options
@@ -618,10 +1365,52 @@ export class WebSocketServer {
         this._ids = []
         this._onConnectionHandler = null
         this._onDisconnectHandler = null
+        this._protocols = []
+        this._protocolSelector = null
+        this._requireProtocol = false
+        this._origins = []
+        this._originCheck = null
+        this._tlsOptions = null
+        this._highWaterMark = 1048576
+        this._maxBuffered = 67108864
+        this._writeTimeoutMs = 0
+        this._validateUtf8 = true
+        this._deflateOpts = null
     }
 
     public onConnection(handler: function(conn: WebSocketConnection): void): void { this._onConnectionHandler = handler }
     public onDisconnect(handler: function(conn: WebSocketConnection): void): void { this._onDisconnectHandler = handler }
+
+    // ── Options (chainable; set before listen) ─────────────────────────
+    // Subprotocols the server speaks, in its order of preference. The first
+    // one the client offered wins.
+    public protocols(list: []string): WebSocketServer { this._protocols = list; return this }
+    // Choose the subprotocol yourself: receives the client's list in its
+    // order and returns one of them, or "" for none. Overrides protocols().
+    public selectProtocol(selector: function(offered: []string): string): WebSocketServer { this._protocolSelector = selector; return this }
+    // Refuse (HTTP 400) a client that offers no protocol the server accepts.
+    public requireProtocol(on: bool): WebSocketServer { this._requireProtocol = on; return this }
+    // Browser origins allowed to connect (exact match, e.g. "https://app.example.com").
+    // Others are refused with HTTP 403 before the upgrade. A request without an
+    // Origin header (a non-browser client) is allowed.
+    public allowOrigins(list: []string): WebSocketServer { this._origins = list; return this }
+    // Decide the origin yourself: return true to allow. Receives "" when the
+    // request has no Origin header. Overrides allowOrigins().
+    public checkOrigin(check: function(origin: string): bool): WebSocketServer { this._originCheck = check; return this }
+    // Serve wss:// directly: { cert, key } PEM strings, as std/net TlsServer takes.
+    public tls(options: any): WebSocketServer { this._tlsOptions = options; return this }
+    // send() returns false above this many queued bytes per connection (default 1 MiB).
+    public highWaterMark(bytes: int): WebSocketServer { this._highWaterMark = bytes; return this }
+    // Close a connection (1008) whose send queue would pass this many bytes
+    // (default 64 MiB; 0 = no limit).
+    public maxBufferedBytes(bytes: int): WebSocketServer { this._maxBuffered = bytes; return this }
+    // Close a connection (1008) when one socket write takes longer (default 0 = no limit).
+    public writeTimeoutMs(ms: int): WebSocketServer { this._writeTimeoutMs = ms; return this }
+    // Check that text messages are UTF-8 and close with 1007 when not (default on).
+    public validateUtf8(on: bool): WebSocketServer { this._validateUtf8 = on; return this }
+    // Accept permessage-deflate (RFC 7692) from clients that offer it (off
+    // by default). Clients that do not offer it are served uncompressed.
+    public perMessageDeflate(options: WSDeflateOptions): WebSocketServer { this._deflateOpts = options; return this }
 
     public connectionCount(): int {
         var n: int = 0
@@ -631,10 +1420,17 @@ export class WebSocketServer {
 
     public isRunning(): bool { return this._running }
 
+    // The address the server listens on ("host:port"); "" before listen().
+    public addr(): string {
+        var srv = this._server
+        if (srv == null) { return "" }
+        return srv.addr()
+    }
+
     // Bind and accept forever. Each accepted client is handshaked and then
     // serviced on its own spawned task so the accept loop keeps running.
     public listen(): void {
-        var srv: TcpServer = new TcpServer(this._options.host, this._options.port)
+        var srv: TcpServer = openListener(this._options.host, this._options.port, this._tlsOptions)
         this._server = srv
         this._running = true
         while (this._running) {
@@ -660,33 +1456,81 @@ export class WebSocketServer {
         }
     }
 
+    // The subprotocol for a client that offered `offered` ("" for none).
+    private _chooseProtocol(offered: []string): string {
+        var sel = this._protocolSelector
+        if (sel != null) {
+            var pick: string = sel(offered)
+            if (pick != "" && containsString(offered, pick)) { return pick }
+            return ""
+        }
+        for (var i: int = 0; i < offered.length; i = i + 1) {
+            if (containsString(this._protocols, offered[i])) { return offered[i] }
+        }
+        return ""
+    }
+
+    private _originAllowed(origin: string): bool {
+        var check = this._originCheck
+        if (check != null) { return check(origin) }
+        if (this._origins.length == 0 || origin == "") { return true }
+        return containsString(this._origins, origin)
+    }
+
     private _serveConnection(tcp: TcpConnection): void {
-        // 1. Handshake.
+        // 1. Handshake (RFC 6455 §4.2.1), within ten seconds.
         var head: string = ""
         try {
+            tcp.setReadDeadline(10000)
             head = readHttpHead(tcp)
+            tcp.setReadDeadline(0)
         } catch (e) {
             try { tcp.close() } catch (e2) { }
             return
         }
-        var req: HttpRequest? = parseHttpRequest(head)
-        if (req == null) { this._rejectHandshake(tcp, 400, "Bad Request"); return }
-        var r: HttpRequest = req
+        var req: HttpHead? = parseHttpHead(head)
+        if (req == null) { this._rejectHandshake(tcp, 400, "Bad Request", ""); return }
+        var r: HttpHead = req
+        if (r.startLine.length < 3 || r.startLine[0] != "GET" || r.startLine[2] != "HTTP/1.1") {
+            this._rejectHandshake(tcp, 400, "Bad Request", ""); return
+        }
+        if (r.header("host") == "" || !hasTokenCI(r.header("upgrade"), "websocket") || !hasTokenCI(r.header("connection"), "upgrade")) {
+            this._rejectHandshake(tcp, 400, "Bad Request", ""); return
+        }
+        if (r.header("sec-websocket-version") != "13") {
+            this._rejectHandshake(tcp, 426, "Upgrade Required", "Sec-WebSocket-Version: 13\r\n"); return
+        }
+        var key: string = r.header("sec-websocket-key")
+        var keyOk: bool = false
+        try { keyOk = key != "" && base64.decodeToBuffer(key).length() == 16 } catch (e) { keyOk = false }
+        if (!keyOk) { this._rejectHandshake(tcp, 400, "Bad Request", ""); return }
+        var path: string = r.startLine[1]
+        if (this._options.path != "" && path != this._options.path) {
+            this._rejectHandshake(tcp, 404, "Not Found", ""); return
+        }
+        if (!this._originAllowed(r.header("origin"))) {
+            this._rejectHandshake(tcp, 403, "Forbidden", ""); return
+        }
+        var protocol: string = this._chooseProtocol(headerTokens(r.header("sec-websocket-protocol")))
+        if (protocol == "" && this._requireProtocol) {
+            this._rejectHandshake(tcp, 400, "Bad Request", ""); return
+        }
 
-        var key: string = mapGet(r.headers, "sec-websocket-key")
-        var upgrade: string = strings.toLower(mapGet(r.headers, "upgrade"))
-        if (key == "" || upgrade != "websocket") {
-            this._rejectHandshake(tcp, 426, "Upgrade Required"); return
-        }
-        if (this._options.path != "" && r.path != this._options.path) {
-            this._rejectHandshake(tcp, 404, "Not Found"); return
-        }
+        var deflate: DeflateContext? = null
+        var dopts = this._deflateOpts
+        if (dopts != null) { deflate = serverAcceptDeflate(r.header("sec-websocket-extensions"), dopts) }
 
         var accept: string = computeAcceptKey(key)
         var resp: string = "HTTP/1.1 101 Switching Protocols\r\n"
         resp = resp + "Upgrade: websocket\r\n"
         resp = resp + "Connection: Upgrade\r\n"
-        resp = resp + "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+        resp = resp + "Sec-WebSocket-Accept: " + accept + "\r\n"
+        if (protocol != "") { resp = resp + "Sec-WebSocket-Protocol: " + protocol + "\r\n" }
+        if (deflate != null) {
+            var agreed: DeflateContext = deflate
+            resp = resp + "Sec-WebSocket-Extensions: " + agreed.extension + "\r\n"
+        }
+        resp = resp + "\r\n"
         try {
             tcp.writeAll(Buffer.fromString(resp))
         } catch (e) {
@@ -697,6 +1541,7 @@ export class WebSocketServer {
         // 2. Register the open connection.
         var id: string = uuid.v4()
         var conn: WebSocketConnection = new WebSocketConnection(id, tcp)
+        conn._configure(this._highWaterMark, this._maxBuffered, this._writeTimeoutMs, protocol, deflate)
         lock (this) {
             this._connections[id] = conn
             this._ids.push(id)
@@ -709,22 +1554,36 @@ export class WebSocketServer {
         var self: WebSocketServer = this
         runReadPump(
             tcp,
-            this._options.maxMessageSize,
-            false,
-            function(): bool { return conn.isOpen() },
-            function(msg: string): void { conn._deliver(msg) },
+            new PumpConfig(this._options.maxMessageSize, this._options.readTimeoutMs, true, this._validateUtf8, deflate),
+            function(): int { return conn.readyState() },
+            function(frame: Buffer, isClose: bool): void { conn._enqueue(frame, isClose, false) },
+            function(binary: bool, payload: Buffer): void {
+                if (binary) {
+                    conn._deliverBinary(payload)
+                } else {
+                    conn._deliver(payload.toStringUtf8())
+                }
+            },
             function(): void { },
             function(): void { conn._firePong() },
             function(code: int, reason: string, _clean: bool): void {
+                // The server closes the TCP connection first (§7.1.1); let the
+                // queued close frame go out before it does.
+                var waited: int = 0
+                while (conn.bufferedAmount() > 0 && waited < 2000) {
+                    time.sleep(5)
+                    waited = waited + 5
+                }
+                conn._markClosed(code, reason)
                 self._removeConnection(id)
-                conn._fireClose(code, reason)
+                conn._fireClose()
                 try { tcp.close() } catch (e) { }
             }
         )
     }
 
-    private _rejectHandshake(tcp: TcpConnection, code: int, message: string): void {
-        var resp: string = "HTTP/1.1 " + string(code) + " " + message + "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    private _rejectHandshake(tcp: TcpConnection, code: int, message: string, extraHeaders: string): void {
+        var resp: string = "HTTP/1.1 " + string(code) + " " + message + "\r\n" + extraHeaders + "Connection: close\r\nContent-Length: 0\r\n\r\n"
         try { tcp.writeAll(Buffer.fromString(resp)) } catch (e) { }
         try { tcp.close() } catch (e) { }
     }
@@ -752,8 +1611,7 @@ export class WebSocketServer {
         }
     }
 
-    // Snapshot the live connections under lock, then act outside the lock so
-    // blocking socket writes never serialize the whole server.
+    // Snapshot the live connections under lock, then act outside the lock.
     private _snapshot(): []WebSocketConnection {
         var out: []WebSocketConnection = []
         lock (this) {
@@ -766,9 +1624,22 @@ export class WebSocketServer {
     }
 
     // ── Broadcast ──────────────────────────────────────────────────────
-    public broadcast(message: string): void {
+    // Each message is encoded once, and the same frame is queued on every
+    // connection, so a slow client never holds up the others. A connection
+    // with compression compresses its own copy (each has its own context).
+    private _broadcastMessage(opcode: int, payload: Buffer, room: string, excludeId: string): void {
+        var frame: Buffer = buildFrame(opcode, payload, false)
         var conns: []WebSocketConnection = this._snapshot()
-        for (var i: int = 0; i < conns.length; i = i + 1) { conns[i].send(message) }
+        for (var i: int = 0; i < conns.length; i = i + 1) {
+            var c: WebSocketConnection = conns[i]
+            if (excludeId != "" && c.id() == excludeId) { continue }
+            if (room != "" && !c.inRoom(room)) { continue }
+            c._sendMessage(opcode, payload, frame)
+        }
+    }
+
+    public broadcast(message: string): void {
+        this._broadcastMessage(OPCODE_TEXT, Buffer.fromString(message), "", "")
     }
 
     public broadcastJSON(data: any): void { this.broadcast(json.stringify(data)) }
@@ -778,24 +1649,32 @@ export class WebSocketServer {
     }
 
     public broadcastExcept(excludeId: string, message: string): void {
-        var conns: []WebSocketConnection = this._snapshot()
-        for (var i: int = 0; i < conns.length; i = i + 1) {
-            if (conns[i].id() != excludeId) { conns[i].send(message) }
-        }
+        this._broadcastMessage(OPCODE_TEXT, Buffer.fromString(message), "", excludeId)
     }
 
     public broadcastToRoom(room: string, message: string): void {
-        var conns: []WebSocketConnection = this._snapshot()
-        for (var i: int = 0; i < conns.length; i = i + 1) {
-            if (conns[i].inRoom(room)) { conns[i].send(message) }
-        }
+        this._broadcastMessage(OPCODE_TEXT, Buffer.fromString(message), room, "")
     }
 
     public broadcastToRoomExcept(room: string, excludeId: string, message: string): void {
-        var conns: []WebSocketConnection = this._snapshot()
-        for (var i: int = 0; i < conns.length; i = i + 1) {
-            if (conns[i].inRoom(room) && conns[i].id() != excludeId) { conns[i].send(message) }
-        }
+        this._broadcastMessage(OPCODE_TEXT, Buffer.fromString(message), room, excludeId)
+    }
+
+    // ── Binary broadcast ───────────────────────────────────────────────
+    public broadcastBinary(data: Buffer): void {
+        this._broadcastMessage(OPCODE_BINARY, data, "", "")
+    }
+
+    public broadcastBinaryExcept(excludeId: string, data: Buffer): void {
+        this._broadcastMessage(OPCODE_BINARY, data, "", excludeId)
+    }
+
+    public broadcastBinaryToRoom(room: string, data: Buffer): void {
+        this._broadcastMessage(OPCODE_BINARY, data, room, "")
+    }
+
+    public broadcastBinaryToRoomExcept(room: string, excludeId: string, data: Buffer): void {
+        this._broadcastMessage(OPCODE_BINARY, data, room, excludeId)
     }
 
     public closeAll(): void {
@@ -814,9 +1693,19 @@ export class WebSocketClient {
     var _readyState: int
     var _onOpenHandler: function?(): void
     var _onMessageHandler: function?(msg: string): void
+    var _onBinaryHandler: function?(data: Buffer): void
     var _onCloseHandler: function?(code: int, reason: string): void
     var _onErrorHandler: function?(err: string): void
     var _reconnectTries: int
+    var _protocols: []string
+    var _protocol: string
+    var _origin: string
+    var _tlsOptions: any
+    var _validateUtf8: bool
+    var _closeCode: int
+    var _closeReason: string
+    var _deflateOpts: WSDeflateOptions?
+    var _deflate: DeflateContext?
 
     constructor(url: string, options: WSClientOptions) {
         this._url = url
@@ -825,16 +1714,53 @@ export class WebSocketClient {
         this._readyState = STATE_CONNECTING
         this._onOpenHandler = null
         this._onMessageHandler = null
+        this._onBinaryHandler = null
         this._onCloseHandler = null
         this._onErrorHandler = null
         this._reconnectTries = 0
+        this._protocols = []
+        this._protocol = ""
+        this._origin = ""
+        this._tlsOptions = null
+        this._validateUtf8 = true
+        this._closeCode = 0
+        this._closeReason = ""
+        this._deflateOpts = null
+        this._deflate = null
     }
 
     public readyState(): int { return this._readyState }
     public isOpen(): bool { return this._readyState == STATE_OPEN }
+    // The subprotocol the server chose ("" when none).
+    public protocol(): string { return this._protocol }
+    // The close code and reason, once the connection has closed (0 and "" before).
+    public closeCode(): int { return this._closeCode }
+    public closeReason(): string { return this._closeReason }
+
+    // ── Options (chainable; set before connect) ────────────────────────
+    // Subprotocols to offer, in order of preference (Sec-WebSocket-Protocol).
+    public protocols(list: []string): WebSocketClient { this._protocols = list; return this }
+    // Send an Origin header, as a browser does.
+    public origin(o: string): WebSocketClient { this._origin = o; return this }
+    // TLS options for wss://, as std/net TlsConnection takes them:
+    // { ca } to trust a private CA, { skipVerify: true } for tests only.
+    public tls(options: any): WebSocketClient { this._tlsOptions = options; return this }
+    // Check that text messages are UTF-8 and close with 1007 when not (default on).
+    public validateUtf8(on: bool): WebSocketClient { this._validateUtf8 = on; return this }
+    // Offer permessage-deflate (RFC 7692); used when the server accepts it.
+    public perMessageDeflate(options: WSDeflateOptions): WebSocketClient { this._deflateOpts = options; return this }
+    // The extensions the server agreed to ("" when none).
+    public extensions(): string {
+        var dc = this._deflate
+        if (dc == null) { return "" }
+        return dc.extension
+    }
 
     public onOpen(handler: function(): void): void { this._onOpenHandler = handler }
     public onMessage(handler: function(msg: string): void): void { this._onMessageHandler = handler }
+    // Binary messages arrive here as their exact bytes. Without an onBinary
+    // handler a binary message goes to onMessage as a string, as in 1.1.
+    public onBinary(handler: function(data: Buffer): void): void { this._onBinaryHandler = handler }
     public onClose(handler: function(code: int, reason: string): void): void { this._onCloseHandler = handler }
     public onError(handler: function(err: string): void): void { this._onErrorHandler = handler }
 
@@ -849,7 +1775,7 @@ export class WebSocketClient {
         // wss:// runs the same RFC 6455 handshake + frame codec over a TLS
         // socket. TlsConnection extends TcpConnection, so the read pump and
         // frame I/O below are unchanged.
-        var tcp: TcpConnection = u.secure ? new TlsConnection(connHost, connPort, null) : new TcpConnection(connHost, connPort, this._options.handshakeTimeoutMs)
+        var tcp: TcpConnection = u.secure ? new TlsConnection(connHost, connPort, this._tlsOptions) : new TcpConnection(connHost, connPort, this._options.handshakeTimeoutMs)
 
         var keyBytes: Buffer = Buffer.fromHex(crypto.randomBytes(16))
         var clientKey: string = base64.encodeBuffer(keyBytes)
@@ -862,18 +1788,59 @@ export class WebSocketClient {
         req = req + "Upgrade: websocket\r\n"
         req = req + "Connection: Upgrade\r\n"
         req = req + "Sec-WebSocket-Key: " + clientKey + "\r\n"
+        if (this._protocols.length > 0) { req = req + "Sec-WebSocket-Protocol: " + strings.join(this._protocols, ", ") + "\r\n" }
+        if (this._origin != "") { req = req + "Origin: " + this._origin + "\r\n" }
+        var dopts = this._deflateOpts
+        if (dopts != null) { req = req + "Sec-WebSocket-Extensions: " + clientDeflateOffer(dopts) + "\r\n" }
         req = req + "Sec-WebSocket-Version: 13\r\n\r\n"
-        tcp.writeAll(Buffer.fromString(req))
 
-        var head: string = readHttpHead(tcp)
-        var lines: []string = strings.split(head, "\r\n")
-        if (lines.length < 1 || strings.indexOf(lines[0], " 101 ") < 0) {
+        var failure: string = ""
+        var chosen: string = ""
+        var deflate: DeflateContext? = null
+        try {
+            tcp.setReadDeadline(this._options.handshakeTimeoutMs)
+            tcp.writeAll(Buffer.fromString(req))
+            var head: string = readHttpHead(tcp)
+            tcp.setReadDeadline(0)
+            var resp: HttpHead? = parseHttpHead(head)
+            if (resp == null) {
+                failure = "no response"
+            } else {
+                var rh: HttpHead = resp
+                chosen = rh.header("sec-websocket-protocol")
+                if (rh.startLine[1] != "101") {
+                    failure = strings.join(rh.startLine, " ")
+                } else if (!hasTokenCI(rh.header("upgrade"), "websocket") || !hasTokenCI(rh.header("connection"), "upgrade")) {
+                    failure = "missing Upgrade/Connection headers"
+                } else if (rh.header("sec-websocket-accept") != computeAcceptKey(clientKey)) {
+                    failure = "wrong Sec-WebSocket-Accept"
+                } else if (rh.header("sec-websocket-extensions") != "") {
+                    if (dopts == null) {
+                        failure = "server chose an extension the client did not offer"
+                    } else {
+                        var answer: DeflateAnswer = clientAcceptDeflate(rh.header("sec-websocket-extensions"), dopts)
+                        failure = answer.failure
+                        deflate = answer.ctx
+                    }
+                }
+                if (failure == "" && chosen != "" && !containsString(this._protocols, chosen)) {
+                    failure = "server chose a subprotocol the client did not offer"
+                }
+            }
+        } catch (e) {
+            failure = string(e)
+        }
+        if (failure != "") {
             try { tcp.close() } catch (e) { }
             this._readyState = STATE_CLOSED
-            throw new Error("handshake failed: " + (lines.length > 0 ? lines[0] : "no response"))
+            throw new Error("handshake failed: " + failure)
         }
 
         this._tcp = tcp
+        this._protocol = chosen
+        this._deflate = deflate
+        this._closeCode = 0
+        this._closeReason = ""
         this._readyState = STATE_OPEN
         this._reconnectTries = 0
         var onOpen = this._onOpenHandler
@@ -882,27 +1849,50 @@ export class WebSocketClient {
         spawn this._readLoop(tcp)
     }
 
+    // Write a frame; client writes are serialized by lock(this).
+    public _write(tcp: TcpConnection, frame: Buffer): void {
+        lock (this) {
+            tcp.writeAll(frame)
+        }
+    }
+
     private _readLoop(tcp: TcpConnection): void {
         var self: WebSocketClient = this
         runReadPump(
             tcp,
-            this._options.maxMessageSize,
-            true,
-            function(): bool { return self._readyState == STATE_OPEN },
-            function(msg: string): void {
+            new PumpConfig(this._options.maxMessageSize, 0, false, this._validateUtf8, this._deflate),
+            function(): int { return self._readyState },
+            function(frame: Buffer, _isClose: bool): void { self._write(tcp, frame) },
+            function(binary: bool, payload: Buffer): void {
+                if (binary) {
+                    var hb = self._onBinaryHandler
+                    if (hb != null) {
+                        hb(payload)
+                        return
+                    }
+                }
                 var h = self._onMessageHandler
-                if (h != null) { h(msg) }
+                if (h != null) { h(payload.toStringUtf8()) }
             },
             function(): void { },
             function(): void { },
             function(code: int, reason: string, clean: bool): void {
+                // The server closes the TCP connection first (§7.1.1): wait
+                // for it briefly before closing ours.
+                if (clean) { drainAfterClose(tcp, true) }
                 self._readyState = STATE_CLOSED
+                self._setClosed(code, reason)
                 var h = self._onCloseHandler
                 if (h != null) { h(code, reason) }
                 try { tcp.close() } catch (e) { }
                 if (!clean && self._options.autoReconnect) { self._tryReconnect() }
             }
         )
+    }
+
+    public _setClosed(code: int, reason: string): void {
+        this._closeCode = code
+        this._closeReason = reason
     }
 
     // Public so the read-pump close callback can reach it via a typed `self`
@@ -927,13 +1917,34 @@ export class WebSocketClient {
         }
     }
 
-    public send(message: string): void {
+    private _openConn(): TcpConnection {
         if (this._readyState != STATE_OPEN) { throw new Error("client not open") }
         var tcp = this._tcp
         if (tcp == null) { throw new Error("client not connected") }
-        var conn: TcpConnection = tcp
+        return tcp
+    }
+
+    public send(message: string): void {
+        this._sendMessage(OPCODE_TEXT, Buffer.fromString(message))
+    }
+
+    // Send a binary message (one masked binary frame, opcode 2).
+    public sendBinary(data: Buffer): void {
+        this._sendMessage(OPCODE_BINARY, data)
+    }
+
+    // One data message; compressed (RSV1) when permessage-deflate was agreed
+    // and it is at or over the threshold. Compressing and writing share the
+    // write lock, so frames leave in compression order.
+    private _sendMessage(opcode: int, payload: Buffer): void {
+        var conn: TcpConnection = this._openConn()
+        var dc = this._deflate
         lock (this) {
-            sendText(conn, message, true)
+            if (dc != null && payload.length() >= dc.threshold) {
+                conn.writeAll(buildFrameRsv(opcode, dc.compress(payload), true, true))
+            } else {
+                conn.writeAll(buildFrame(opcode, payload, true))
+            }
         }
     }
 
@@ -948,24 +1959,39 @@ export class WebSocketClient {
         var tcp = this._tcp
         if (tcp == null) { return }
         var conn: TcpConnection = tcp
-        lock (this) {
-            try { sendPing(conn, Buffer.alloc(0), true) } catch (e) { }
-        }
+        try { this._write(conn, buildFrame(OPCODE_PING, Buffer.alloc(0), true)) } catch (e) { }
     }
 
+    // Start the close handshake: the socket closes when the server answers
+    // (or after five seconds), and onClose then reports the server's code.
+    // code must be one a peer may receive (see isValidCloseCode) or
+    // CLOSE_NO_STATUS; the reason is cut to 123 bytes.
     public close(code: int, reason: string): void {
+        if (code != CLOSE_NO_STATUS && !isValidCloseCode(code)) {
+            throw new Error("invalid close code " + string(code))
+        }
         if (this._readyState != STATE_OPEN) { return }
         this._readyState = STATE_CLOSING
         var tcp = this._tcp
         if (tcp != null) {
             var conn: TcpConnection = tcp
-            lock (this) {
-                try { sendClose(conn, code, reason, true) } catch (e) { }
-                try { conn.close() } catch (e) { }
-            }
+            try { this._write(conn, buildFrame(OPCODE_CLOSE, closePayload(code, reason), true)) } catch (e) { }
+            spawn this._closeTimer(conn, 5000)
         }
-        this._readyState = STATE_CLOSED
     }
+
+    public _closeTimer(tcp: TcpConnection, ms: int): void {
+        time.sleep(ms)
+        if (this._readyState != STATE_CLOSED) {
+            try { tcp.close() } catch (e) { }
+        }
+    }
+}
+
+// A plain listener, or a TLS one when `tlsOptions` is set.
+function openListener(host: string, port: int, tlsOptions: any): TcpServer {
+    if (tlsOptions != null) { return new TlsServer(host, port, tlsOptions) }
+    return new TcpServer(host, port)
 }
 
 // ─── Map helpers ─────────────────────────────────────────────────────────────
@@ -998,7 +2024,8 @@ export function connect(url: string, options: WSClientOptions?): WebSocketClient
     return client
 }
 
-// Build a client without connecting (register handlers first, then .connect()).
+// Build a client without connecting (register handlers and options first,
+// then .connect()).
 export function createWSClient(url: string, options: WSClientOptions?): WebSocketClient {
     var opts: WSClientOptions = options != null ? options : new WSClientOptionsBuilder().build()
     return new WebSocketClient(url, opts)
