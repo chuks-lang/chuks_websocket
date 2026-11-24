@@ -1390,7 +1390,7 @@ export class WebSocketServer {
     public selectProtocol(selector: function(offered: []string): string): WebSocketServer { this._protocolSelector = selector; return this }
     // Refuse (HTTP 400) a client that offers no protocol the server accepts.
     public requireProtocol(on: bool): WebSocketServer { this._requireProtocol = on; return this }
-    // Browser origins allowed to connect (exact match, e.g. "https://app.example.com").
+    // Browser origins allowed to connect (exact match, scheme and host, e.g. app.example.com over https).
     // Others are refused with HTTP 403 before the upgrade. A request without an
     // Origin header (a non-browser client) is allowed.
     public allowOrigins(list: []string): WebSocketServer { this._origins = list; return this }
